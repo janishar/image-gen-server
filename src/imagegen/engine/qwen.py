@@ -28,13 +28,31 @@ def noise_seed(seed: int, images: list[Image.Image] | None) -> int:
     return int.from_bytes(digest.digest()[:8], "big") >> 1
 
 
-def load_pipeline(path: str, device: str, shared: dict | None = None):
-    """A QwenImage21Pipeline from `path`, reusing already-loaded `shared` components instead of loading them again."""
+def load_pipeline(path: str, device: str, shared: dict | None = None, transformer: str = "bf16", text_encoder: str = "bf16"):
+    """A QwenImage21Pipeline from `path`, reusing already-loaded `shared` components instead of loading them again.
+
+    `transformer`/`text_encoder` are "bf16" or "int8"; int8 quantizes each Linear weight as it loads (nothing saved).
+    """
     from diffusers import QwenImage21Pipeline  # type: ignore[import-not-found]
 
+    kwargs = dict(shared or {})
+    mapping = {}
+    if "int8" in (transformer, text_encoder):
+        import diffusers
+        import transformers
+        from torchao.quantization import Int8WeightOnlyConfig
+
+        if transformer == "int8":
+            mapping["transformer"] = diffusers.TorchAoConfig(Int8WeightOnlyConfig())
+        if text_encoder == "int8" and "text_encoder" not in kwargs:  # a shared one is already loaded as it is
+            mapping["text_encoder"] = transformers.TorchAoConfig(Int8WeightOnlyConfig())
+    if mapping:
+        from diffusers.quantizers import PipelineQuantizationConfig
+
+        kwargs["quantization_config"] = PipelineQuantizationConfig(quant_mapping=mapping)
     # device_map loads each weight straight to the GPU; passed components are used as-is, so only the rest load.
     # ponytail: assumes both checkpoints ship the same text_encoder/vae (file sizes match); load separately if not
-    return QwenImage21Pipeline.from_pretrained(path, dtype=torch.bfloat16, device_map=device, **(shared or {}))
+    return QwenImage21Pipeline.from_pretrained(path, dtype=torch.bfloat16, device_map=device, **kwargs)
 
 
 def shared_components(pipe) -> dict:

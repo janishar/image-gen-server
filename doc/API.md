@@ -31,7 +31,7 @@ validates the body before queueing it, so a `202` means the task was accepted.
 | Field | Type | Default | Rules |
 | --- | --- | --- | --- |
 | `prompt` | string | required | Must not be empty. Long prompts (several thousand characters) are fine. |
-| `model` | string | `"base"` | `"base"` or `"turbo"`. It must be configured on the server (see `/health`). |
+| `model` | string | `"turbo"` | `"turbo"` or `"base"`. It must be configured on the server (see `/health`). When the server has no Turbo model, the default is `"base"`. |
 | `ratio` | string | see [Size](#size) | `1:1`, `4:3`, `3:4`, `3:2`, `2:3`, `16:9`, `9:16` |
 | `width` | integer | see [Size](#size) | 256–2752, a multiple of 32 |
 | `height` | integer | see [Size](#size) | 256–2752, a multiple of 32 |
@@ -121,6 +121,7 @@ This shows which models are configured and loaded, and how busy the queue is.
 ```json
 {
   "device": "mps",
+  "precision": {"transformer": "bf16", "text_encoder": "bf16"},
   "models": {"base": {"configured": true, "loaded": true}, "turbo": {"configured": true, "loaded": false}},
   "queued": 1,
   "busy": true,
@@ -129,7 +130,8 @@ This shows which models are configured and loaded, and how busy the queue is.
 ```
 
 `queued` is the number of tasks waiting, `busy` is whether the worker is rendering or loading a `PRELOAD` model, and `tasks` is the number of tasks
-stored, including finished ones. Use `models.<name>.configured` to decide which models to offer.
+stored, including finished ones. Use `models.<name>.configured` to decide which models to offer. `precision` is the
+weight precision the server loads the transformer and text encoder in, `bf16` or `int8`, the same for every model.
 
 ## Size
 
@@ -169,6 +171,10 @@ These were measured on an Apple M-series Mac with 64 GB of memory:
 | Turbo, 2752 × 1536 | ~2 min |
 | Base, 768 × 768, 12 steps | ~18 s |
 | Base, ~2K, 40 steps | several minutes |
+
+These times are for `bf16`. With `int8` (see `precision` in `/health`), the transformer takes about half the memory
+and the text encoder about 57% (13 GB less with both, measured with Turbo), renders are about 15% slower, and images
+change slightly for the same seed (fine texture only).
 
 A task's total wait is its own render plus every render queued ahead of it. With many tasks in flight that can be
 tens of minutes, so set client deadlines with that in mind (see below).

@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -24,6 +25,7 @@ from imagegen.store import TaskDB
 
 class FakeRegistry:
     device = "cpu"
+    precision = {"transformer": "int8", "text_encoder": "bf16"}
 
     def __init__(self, configured=("base", "turbo")):
         self.configured = configured
@@ -170,7 +172,7 @@ class TestApi(ServerCase):
         self.assertEqual((created["status"], created["position"]), ("CREATED", 0))
         self.assertEqual(len(created["task_id"]), 32)
         done = self.wait(created["task_id"], "COMPLETED")
-        self.assertEqual((done["model"], done["seed"], done["position"], done["error"]), ("base", 7, None, None))
+        self.assertEqual((done["model"], done["seed"], done["position"], done["error"]), ("turbo", 7, None, None))
         self.assertEqual((done["step"], done["steps"]), (4, 4))
         self.assertIsInstance(done["elapsed_ms"], int)
         self.assertTrue(done["created_at"] <= done["started_at"] <= done["finished_at"])
@@ -181,7 +183,7 @@ class TestApi(ServerCase):
             self.assertEqual(status, 200)
             self.assertEqual(headers["Content-Type"], "image/png")
             self.assertEqual(int(headers["Content-Length"]), len(data))
-            self.assertEqual((headers["X-Model"], headers["X-Steps"], headers["X-Seed"]), ("base", "40", "7"))
+            self.assertEqual((headers["X-Model"], headers["X-Steps"], headers["X-Seed"]), ("turbo", "8", "7"))
             self.assertIn("X-Elapsed-Ms", headers)
             self.assertEqual(Image.open(io.BytesIO(data)).size, (8, 8))
 
@@ -253,6 +255,7 @@ class TestApi(ServerCase):
             json.loads(data),
             {
                 "device": "cpu",
+                "precision": {"transformer": "int8", "text_encoder": "bf16"},
                 "models": {"base": {"configured": True, "loaded": False}, "turbo": {"configured": True, "loaded": False}},
                 "queued": 0,
                 "busy": False,
@@ -368,7 +371,7 @@ class TestPersistence(unittest.TestCase):
         return store
 
     def submit(self, store, prompt, **fields):
-        return store.submit(dump_request(GenerateRequest(prompt=prompt, **fields)))["task_id"]
+        return store.submit(dump_request(GenerateRequest(prompt=prompt, **{"model": "base", **fields})))["task_id"]
 
     def test_crash_recovery(self):
         crashed = FakeRegistry()
@@ -402,7 +405,7 @@ class TestPersistence(unittest.TestCase):
         old.shutdown()  # nothing ran: shut down before the worker could pick anything
         db = TaskDB(self.path)
         db.insert("t1", "turbo", 42, json.dumps(dump_request(GenerateRequest(prompt="x", model="turbo"))), 1.0)
-        db.insert("t2", "base", 42, json.dumps(dump_request(GenerateRequest(prompt="y", images=(base64.b64decode(b64png()),)))), 2.0)
+        db.insert("t2", "base", 42, json.dumps(dump_request(GenerateRequest(prompt="y", model="base", images=(base64.b64decode(b64png()),)))), 2.0)
         db.close()
         registry = FakeRegistry(configured=("base",))
         new = self.store(registry)
@@ -473,6 +476,9 @@ class TestConfig(unittest.TestCase):
                          os.path.expanduser("~/x.db"))
         s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "MAX_QUEUED": "8", "TASK_TTL": "60"})
         self.assertEqual((s.max_queued, s.task_ttl), (8, 60))
+        self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("bf16", "bf16"))
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "int8", "TEXT_ENCODER_PRECISION": " int8 "})
+        self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("int8", "int8"))
 
     def test_preload_and_turbo(self):
         s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "QWEN_IMAGE_21_TURBO_PATH": self.tmp.name, "PRELOAD": "turbo, base"})
@@ -489,16 +495,62 @@ class TestConfig(unittest.TestCase):
             {"QWEN_IMAGE_21_PATH": self.base, "PORT": "http"},
             {"QWEN_IMAGE_21_PATH": self.base, "MAX_QUEUED": "0"},
             {"QWEN_IMAGE_21_PATH": self.base, "TASK_TTL": "1h"},
+            {"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "int4"},
+            {"QWEN_IMAGE_21_PATH": self.base, "TEXT_ENCODER_PRECISION": "fp16"},
         ]:
             with self.subTest(env=env), self.assertRaises(ValueError):
                 load_settings(env)
 
 
+class TestLoadPipeline(unittest.TestCase):
+    """load_pipeline's from_pretrained kwargs per precision, with from_pretrained stubbed: no weights."""
+
+    def load(self, shared=None, **precision):
+        import diffusers
+        from imagegen.engine import qwen
+
+        with mock.patch.object(diffusers.QwenImage21Pipeline, "from_pretrained") as fp:
+            qwen.load_pipeline("/m", "mps", shared, **precision)
+        fp.assert_called_once()
+        return fp.call_args.kwargs
+
+    def test_quant_mapping(self):
+        import diffusers
+        import torch
+        import transformers
+        from torchao.quantization import Int8WeightOnlyConfig
+
+        kinds = {"transformer": diffusers.TorchAoConfig, "text_encoder": transformers.TorchAoConfig}
+        for t in ("bf16", "int8"):
+            for te in ("bf16", "int8"):
+                with self.subTest(transformer=t, text_encoder=te):
+                    kw = self.load(transformer=t, text_encoder=te)
+                    self.assertEqual((kw["dtype"], kw["device_map"]), (torch.bfloat16, "mps"))
+                    want = {n for n, p in (("transformer", t), ("text_encoder", te)) if p == "int8"}
+                    if not want:
+                        self.assertNotIn("quantization_config", kw)
+                        continue
+                    mapping = kw["quantization_config"].quant_mapping
+                    self.assertEqual(set(mapping), want)
+                    for name, cfg in mapping.items():
+                        self.assertIs(type(cfg), kinds[name])
+                        self.assertIsInstance(cfg.quant_type, Int8WeightOnlyConfig)
+
+    def test_shared_text_encoder_not_quantized(self):
+        shared = {"text_encoder": object(), "vae": object(), "processor": object()}
+        kw = self.load(shared, transformer="int8", text_encoder="int8")
+        self.assertIs(kw["text_encoder"], shared["text_encoder"])
+        self.assertEqual(set(kw["quantization_config"].quant_mapping), {"transformer"})
+        kw = self.load(shared, transformer="bf16", text_encoder="int8")
+        self.assertNotIn("quantization_config", kw)
+
+
 class TestSchemas(unittest.TestCase):
     def test_defaults(self):
-        req = parse_request({"prompt": "hi"}, ("base",))
+        req = parse_request({"prompt": "hi"}, MODELS)
         self.assertEqual(req, GenerateRequest(prompt="hi"))
-        self.assertEqual((req.model, req.steps, req.seed, req.transparent, req.images), ("base", 40, 42, False, ()))
+        self.assertEqual((req.model, req.steps, req.seed, req.transparent, req.images), ("turbo", 40, 42, False, ()))
+        self.assertEqual(parse_request({"prompt": "hi"}, ("base",)).model, "base")
 
     def test_full(self):
         req = parse_request(

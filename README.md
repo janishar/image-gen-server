@@ -17,6 +17,8 @@ uv run --env-file .env image-gen-server
 | `QWEN_IMAGE_21_PATH` | required | Qwen-Image-2.1 model directory |
 | `QWEN_IMAGE_21_TURBO_PATH` | unset | Qwen-Image-2.1-Turbo model directory (turbo off if unset) |
 | `QWEN_IMAGE_21_DEVICE` | `auto` | `auto`, `mps`, `cuda` or `cpu` (auto: MPS, else CUDA, else CPU) |
+| `TRANSFORMER_PRECISION` | `bf16` | `bf16` or `int8`: transformer weights, quantized while loading (no converted copy on disk) |
+| `TEXT_ENCODER_PRECISION` | `bf16` | `bf16` or `int8`: text encoder weights, same as above (the VAE always stays `bf16`) |
 | `HOST` | `127.0.0.1` | Bind address |
 | `PORT` | `8740` | Port |
 | `PRELOAD` | empty | Comma list of models to load at startup, e.g. `turbo` or `base,turbo` |
@@ -30,7 +32,7 @@ Renders take 30 s to 10 min, so the API is asynchronous: submit, poll, download.
 kept in the SQLite file `DB_PATH`, so they survive a restart (see below).
 
 - `POST /v1/tasks` takes JSON and answers `202 {"data": {"task_id", "status": "CREATED", "position"}}`
-  (`position` 0 = runs next). Fields: `prompt` (required), `model` (`base`/`turbo`), `ratio` (`1:1`, `4:3`, `3:4`,
+  (`position` 0 = runs next). Fields: `prompt` (required), `model` (`turbo`, the default when configured, or `base`), `ratio` (`1:1`, `4:3`, `3:4`,
   `3:2`, `2:3`, `16:9`, `9:16`), `width`/`height` (multiples of 32, 256..2752), `steps` (1..100, default 40; turbo
   always runs its own 8-step schedule), `seed` (default 42), `transparent` (RGBA output), `images` (up to 10 base64
   images to edit). 400 bad request, 429 `MAX_QUEUED` tasks waiting (with `Retry-After: 30`), 503 shutting down.

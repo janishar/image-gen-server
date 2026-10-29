@@ -33,7 +33,7 @@ class ValidationError(ValueError):
 @dataclass(frozen=True)
 class GenerateRequest:
     prompt: str
-    model: str = "base"
+    model: str = "turbo"
     ratio: str | None = None
     width: int | None = None
     height: int | None = None
@@ -102,7 +102,7 @@ def parse_request(data: object, available_models: Collection[str]) -> GenerateRe
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValidationError("prompt must be a non-empty string")
 
-    model = data.get("model", "base")
+    model = data.get("model", "turbo" if "turbo" in available_models else "base")  # turbo by default, base if it is all there is
     if model not in MODELS:
         raise ValidationError(f"model must be one of {', '.join(MODELS)}")
     if model not in available_models:

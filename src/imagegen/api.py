@@ -66,7 +66,7 @@ def make_server(host: str, port: int, tasks: TaskStore, registry) -> ThreadingHT
         def do_GET(self) -> None:
             path = urlsplit(self.path).path  # a cache-buster query must not turn a live task into a 404
             if path == "/health":
-                return self.send_json(200, {"device": registry.device, "models": registry.status(), **tasks.stats()})
+                return self.send_json(200, {"device": registry.device, "precision": registry.precision, "models": registry.status(), **tasks.stats()})
             if path == TASKS:
                 return self.send_json(405, {"error": "use POST"}, {"Allow": "POST"})
             route = self.task_path(path)

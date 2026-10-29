@@ -14,9 +14,10 @@ class ModelRegistry:
     add an LRU drop + device.empty_cache if a third model or a smaller machine shows up.
     """
 
-    def __init__(self, model_paths: dict[str, str], device: str):
+    def __init__(self, model_paths: dict[str, str], device: str, transformer: str = "bf16", text_encoder: str = "bf16"):
         self.model_paths = dict(model_paths)
         self.device = device
+        self.precision = {"transformer": transformer, "text_encoder": text_encoder}
         self._pipes: dict[str, object] = {}
         if device == "mps":
             patch_mps_empty_cache()
@@ -37,7 +38,7 @@ class ModelRegistry:
             other = next(iter(self._pipes.values()), None)
             shared = qwen.shared_components(other) if other is not None else None
             print(f"Loading {name} from {self.model_paths[name]}", flush=True)
-            self._pipes[name] = qwen.load_pipeline(self.model_paths[name], self.device, shared)
+            self._pipes[name] = qwen.load_pipeline(self.model_paths[name], self.device, shared, **self.precision)
         return self._pipes[name]
 
     def render(self, req: GenerateRequest, on_step=None):
