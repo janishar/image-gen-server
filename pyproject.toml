@@ -1,0 +1,30 @@
+[project]
+name = "image-gen-server"
+version = "0.1.0"
+description = "Queued on-demand Qwen-Image-2.1 (base and Turbo) image generation server"
+readme = "README.md"
+authors = [
+    { name = "Janishar Ali", email = "janishar.ali@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "diffusers",
+    "pillow>=12.3.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "transformers>=5.17.0",
+]
+
+[project.scripts]
+image-gen-server = "imagegen.__main__:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+diffusers = { git = "https://github.com/huggingface/diffusers" }
+
+[tool.uv.build-backend]
+module-name = "imagegen"

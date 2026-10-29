@@ -1,0 +1,44 @@
+"""Lazily loaded, resident pipelines keyed by model name."""
+
+from __future__ import annotations
+
+from ..schemas import MODELS, GenerateRequest
+from . import qwen
+from .device import patch_mps_empty_cache
+
+
+class ModelRegistry:
+    """Loads each configured model on first use and keeps it until the process exits.
+
+    ponytail: both models resident ≈44 GB of a 64 GB Mac (text_encoder/vae shared); eviction left out,
+    add an LRU drop + device.empty_cache if a third model or a smaller machine shows up.
+    """
+
+    def __init__(self, model_paths: dict[str, str], device: str):
+        self.model_paths = dict(model_paths)
+        self.device = device
+        self._pipes: dict[str, object] = {}
+        if device == "mps":
+            patch_mps_empty_cache()
+
+    @property
+    def configured(self) -> tuple[str, ...]:
+        return tuple(name for name in MODELS if name in self.model_paths)
+
+    def status(self) -> dict[str, dict]:
+        return {
+            name: {"configured": name in self.model_paths, "loaded": name in self._pipes}
+            for name in MODELS
+        }
+
+    def get(self, name: str):
+        """The pipeline for `name`, loading it now if needed. Worker thread only."""
+        if name not in self._pipes:
+            other = next(iter(self._pipes.values()), None)
+            shared = qwen.shared_components(other) if other is not None else None
+            print(f"Loading {name} from {self.model_paths[name]}", flush=True)
+            self._pipes[name] = qwen.load_pipeline(self.model_paths[name], self.device, shared)
+        return self._pipes[name]
+
+    def render(self, req: GenerateRequest, on_step=None):
+        return qwen.render(self.get(req.model), req, on_step)
