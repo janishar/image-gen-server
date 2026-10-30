@@ -42,6 +42,8 @@ kept in the SQLite file `DB_PATH`, so they survive a restart (see below).
   404 for an unknown id, or `TASK_TTL` seconds after the task finished.
 - `GET /v1/tasks/{task_id}/image` returns the `image/png` once `COMPLETED`, with headers `X-Model`, `X-Seed`,
   `X-Steps`, `X-Elapsed-Ms`; 409 before that or if it failed. It can be fetched again until the task expires.
+  `?format=jpeg` returns a compressed `image/jpeg` at the same pixel size, for example to send to a vision LLM.
+  Transparency is flattened onto white.
 - `GET /health` reports the device, models and queue: `queued` (waiting tasks), `busy`, `tasks` (retained).
 
 Errors are JSON `{"error": ...}`. On SIGTERM/Ctrl+C the server stops taking tasks (503), finishes and stores the one

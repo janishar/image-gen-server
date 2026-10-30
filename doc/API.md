@@ -96,7 +96,9 @@ A `404` (`{"error": "unknown task"}`) means the id never existed or has expired.
 ### GET /v1/tasks/{task_id}/image
 
 This downloads the result of a `COMPLETED` task. The `200` body is the PNG itself (`Content-Type: image/png`), with
-these headers:
+the headers below. Add `?format=jpeg` for a compressed JPEG at the same pixel size (`Content-Type: image/jpeg`, quality
+92), for example to send the image to a vision LLM. Transparency is flattened onto white, so keep the PNG if you need
+the alpha channel. Each JPEG is encoded when you ask for it. Any other `format` gets a `400`.
 
 | Header | Value |
 | --- | --- |
@@ -112,7 +114,7 @@ Downloading doesn't delete anything, so a retry is safe until the task expires. 
 | 409 | The task is not `COMPLETED` yet. `error` says `task is CREATED` or `task is IN_PROGRESS`. If the task failed, `error` holds the failure message. |
 | 404 | Unknown or expired task. |
 
-Output images are PNG, often RGBA even when `transparent` is false. Convert them if your storage needs RGB or JPEG.
+Output images are often RGBA even when `transparent` is false. Convert them if your storage needs RGB or JPEG.
 
 ### GET /health
 

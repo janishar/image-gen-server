@@ -1,17 +1,33 @@
-"""The HTTP API: submit a render task, poll it, download its PNG; GET /health reports models and queue."""
+"""The HTTP API: submit a render task, poll it, download its image; GET /health reports models and queue."""
 
 from __future__ import annotations
 
 import io
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+
+from PIL import Image
 
 from .jobs import COMPLETED, Cancelled, QueueFull, TaskStore
 from .schemas import ValidationError, dump_request, load_images, parse_request
 
 MAX_BODY = 64 * 1024 * 1024
 TASKS = "/v1/tasks"
+IMAGE_FORMATS = ("png", "jpeg")
+JPEG_QUALITY = 92
+
+
+def to_jpeg(png: bytes) -> bytes:
+    """The stored PNG as a compressed JPEG: same pixel size, transparency flattened onto white."""
+    # ponytail: encoded on every download, store the JPEG beside the PNG if clients fetch the same image often
+    with Image.open(io.BytesIO(png)) as image:
+        rgba = image.convert("RGBA")
+    buf = io.BytesIO()
+    Image.alpha_composite(Image.new("RGBA", rgba.size, "white"), rgba).convert("RGB").save(
+        buf, format="JPEG", quality=JPEG_QUALITY
+    )
+    return buf.getvalue()
 
 
 def png_render(registry):
@@ -64,7 +80,8 @@ def make_server(host: str, port: int, tasks: TaskStore, registry) -> ThreadingHT
             return None
 
         def do_GET(self) -> None:
-            path = urlsplit(self.path).path  # a cache-buster query must not turn a live task into a 404
+            url = urlsplit(self.path)
+            path = url.path  # a cache-buster query must not turn a live task into a 404
             if path == "/health":
                 return self.send_json(200, {"device": registry.device, "precision": registry.precision, "models": registry.status(), **tasks.stats()})
             if path == TASKS:
@@ -76,6 +93,9 @@ def make_server(host: str, port: int, tasks: TaskStore, registry) -> ThreadingHT
             if not wants_image:
                 view = tasks.get(task_id)
                 return self.send_json(200, {"data": view}) if view else self.send_json(404, {"error": "unknown task"})
+            image_format = parse_qs(url.query).get("format", ["png"])[-1]
+            if image_format not in IMAGE_FORMATS:
+                return self.send_json(400, {"error": f"format must be one of {', '.join(IMAGE_FORMATS)}"})
             found = tasks.result(task_id)
             if found is None:
                 return self.send_json(404, {"error": "unknown task"})
@@ -83,8 +103,10 @@ def make_server(host: str, port: int, tasks: TaskStore, registry) -> ThreadingHT
             if view["status"] != COMPLETED:
                 return self.send_json(409, {"error": view["error"] or f"task is {view['status']}"})
             data, steps = result
+            if image_format == "jpeg":
+                data = to_jpeg(data)
             self.send_response(200)
-            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Type", f"image/{image_format}")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("X-Model", view["model"])
             self.send_header("X-Seed", str(view["seed"]))

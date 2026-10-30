@@ -16,7 +16,7 @@ import urllib.request
 
 from PIL import Image
 
-from imagegen.api import make_server, png_render
+from imagegen.api import make_server, png_render, to_jpeg
 from imagegen.config import load_settings
 from imagegen.jobs import TaskStore
 from imagegen.schemas import MODELS, GenerateRequest, ValidationError, dump_request, load_images, parse_request
@@ -235,6 +235,27 @@ class TestApi(ServerCase):
         status, _, data = self.request("GET", f"/v1/tasks/{bad}/image")
         self.assertEqual((status, json.loads(data)["error"]), (409, "RuntimeError: kaput"))
         self.wait(good, "COMPLETED")
+
+    def test_image_jpeg(self):
+        task_id = self.submit({"prompt": "cat"})["task_id"]
+        self.wait(task_id, "COMPLETED")
+        png = self.request("GET", f"/v1/tasks/{task_id}/image")[2]
+        status, headers, data = self.request("GET", f"/v1/tasks/{task_id}/image?format=jpeg&t=1")
+        self.assertEqual((status, headers["Content-Type"]), (200, "image/jpeg"))
+        self.assertEqual(int(headers["Content-Length"]), len(data))
+        self.assertIn("X-Elapsed-Ms", headers)
+        with Image.open(io.BytesIO(data)) as jpeg, Image.open(io.BytesIO(png)) as original:
+            self.assertEqual((jpeg.format, jpeg.size), ("JPEG", original.size))
+        self.assertEqual(self.request("GET", f"/v1/tasks/{task_id}/image?format=png")[2], png)
+        status, _, data = self.request("GET", f"/v1/tasks/{task_id}/image?format=webp")
+        self.assertEqual((status, json.loads(data)["error"]), (400, "format must be one of png, jpeg"))
+
+    def test_jpeg_flattens_alpha_onto_white(self):
+        buf = io.BytesIO()
+        Image.new("RGBA", (16, 16), (255, 0, 0, 0)).save(buf, "PNG")
+        with Image.open(io.BytesIO(to_jpeg(buf.getvalue()))) as jpeg:
+            self.assertEqual((jpeg.mode, jpeg.size), ("RGB", (16, 16)))
+            self.assertTrue(all(channel > 250 for channel in jpeg.getpixel((8, 8))))
 
     def test_unknown_and_expired(self):
         for path in ("/v1/tasks/nope", "/v1/tasks/nope/image"):
