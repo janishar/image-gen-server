@@ -70,7 +70,34 @@ def shared_components(pipe) -> dict:
     return {name: getattr(pipe, name) for name in SHARED}
 
 
-def render(pipe, req: GenerateRequest, on_step=None) -> tuple[Image.Image, int]:
+def trim_vae(vae) -> None:
+    """Hold a decode near 3.7 GiB at any size: tile it, and drop the feature cache a single frame never reads."""
+    # ponytail: patches private VAE methods, recheck on a diffusers bump
+    clear_cache, encode = vae.clear_cache, vae._encode
+
+    def clear_and_drop():
+        clear_cache()
+        vae._feat_map = vae._enc_feat_map = None
+
+    def encode_untiled(x):  # tiles are for the decode; a reference stays whole
+        vae.use_tiling = False
+        try:
+            return encode(x)
+        finally:
+            vae.use_tiling = True
+
+    vae.clear_cache, vae._encode = clear_and_drop, encode_untiled
+    vae.enable_tiling(tile_sample_min_height=1024, tile_sample_min_width=1024,
+                      tile_sample_stride_height=768, tile_sample_stride_width=768)
+
+
+def reference_side(count: int, max_pixels: int) -> int:
+    """The pipeline's output_resolution for `count` references: 1024 unless their pixels would pass `max_pixels`."""
+    # ponytail: 4+ references with no size also shrink the output; ORA always sends a size
+    return min(1024, int((max_pixels / max(count, 1)) ** 0.5) // 32 * 32)
+
+
+def render(pipe, req: GenerateRequest, on_step=None, max_reference_pixels: int = 10 * 1024**2) -> tuple[Image.Image, int]:
     """Run `req` through `pipe`, calling on_step(done, total) after each step; returns the image and steps run."""
 
     def on_step_end(p, i: int, t, kwargs: dict) -> dict:
@@ -98,5 +125,6 @@ def render(pipe, req: GenerateRequest, on_step=None) -> tuple[Image.Image, int]:
         num_inference_steps=req.steps,
         generator=torch.Generator(device="cpu").manual_seed(noise_seed(req.seed, images)),
         callback_on_step_end=on_step_end,
+        output_resolution=reference_side(len(images or ()), max_reference_pixels),
     ).images[0]
     return out, len(sigmas) if sigmas else req.steps

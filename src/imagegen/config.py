@@ -23,6 +23,8 @@ class Settings:
     db_path: str
     transformer_precision: str
     text_encoder_precision: str
+    gpu_memory_fraction: float
+    max_reference_pixels: int
 
     @property
     def model_paths(self) -> dict[str, str]:
@@ -61,6 +63,17 @@ def _precision(env, key: str, choices: tuple[str, ...]) -> str:
     return value
 
 
+def _fraction(env, key: str) -> float:
+    text = env.get(key, "").strip() or "0"
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"{key} must be a number, got {text!r}") from None
+    if not 0 <= value <= 1:
+        raise ValueError(f"{key} must be between 0 and 1, got {value}")
+    return value
+
+
 def load_settings(env=os.environ) -> Settings:
     """Read and check the settings, raising ValueError on anything wrong."""
     base = _model_dir(env, "QWEN_IMAGE_21_PATH", required=True)
@@ -90,6 +103,8 @@ def load_settings(env=os.environ) -> Settings:
         db_path=os.path.abspath(os.path.expanduser(env.get("DB_PATH", "").strip() or "data/imagegen.sqlite3")),
         transformer_precision=_precision(env, "TRANSFORMER_PRECISION", PRECISIONS),
         text_encoder_precision=_precision(env, "TEXT_ENCODER_PRECISION", TEXT_ENCODER_PRECISIONS),
+        gpu_memory_fraction=_fraction(env, "GPU_MEMORY_FRACTION"),
+        max_reference_pixels=_positive(env, "MAX_REFERENCE_PIXELS", 10 * 1024**2),
     )
     for name in settings.preload:
         if name not in settings.model_paths:

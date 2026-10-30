@@ -27,7 +27,10 @@ def main() -> None:
     except ValueError as e:
         print(f"image-gen-server: {e}", file=sys.stderr)
         sys.exit(2)
-    registry = ModelRegistry(settings.model_paths, device, settings.transformer_precision, settings.text_encoder_precision)
+    registry = ModelRegistry(
+        settings.model_paths, device, settings.transformer_precision, settings.text_encoder_precision,
+        settings.gpu_memory_fraction, settings.max_reference_pixels,
+    )
     tasks = TaskStore(png_render(registry), settings.db_path, settings.max_queued, settings.task_ttl)
     lock = open(settings.db_path + ".lock", "w")  # held until exit: a second server on this db would recover() our rows
     try:

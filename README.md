@@ -19,6 +19,8 @@ uv run --env-file .env image-gen-server
 | `QWEN_IMAGE_21_DEVICE` | `auto` | `auto`, `mps`, `cuda` or `cpu` (auto: MPS, else CUDA, else CPU) |
 | `TRANSFORMER_PRECISION` | `bf16` | `bf16`, `int8`, `fp8` or `fp8_dynamic`: transformer weights, quantized while loading (no converted copy on disk). `fp8_dynamic` also quantizes activations and uses the FP8 matmul; it needs a CUDA GPU with FP8 support |
 | `TEXT_ENCODER_PRECISION` | `bf16` | `bf16`, `int8` or `fp8`: text encoder weights, same as above (the VAE always stays `bf16`) |
+| `GPU_MEMORY_FRACTION` | `0` (no cap) | CUDA only: the share of the card this server may hold, so an overrun fails one render instead of a process beside it. CUDA also tiles the VAE decode |
+| `MAX_REFERENCE_PIXELS` | `10485760` | Total reference pixels per request; past it every reference shrinks evenly. Each reference is about 1 MP inside the model |
 | `HOST` | `127.0.0.1` | Bind address |
 | `PORT` | `8740` | Port |
 | `PRELOAD` | empty | Comma list of models to load at startup, e.g. `turbo` or `base,turbo` |

@@ -502,6 +502,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("int8", "int8"))
         s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "fp8_dynamic", "TEXT_ENCODER_PRECISION": "fp8"})
         self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("fp8_dynamic", "fp8"))
+        self.assertEqual((s.gpu_memory_fraction, s.max_reference_pixels), (0, 10 * 1024**2))
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "GPU_MEMORY_FRACTION": "0.5", "MAX_REFERENCE_PIXELS": "7340032"})
+        self.assertEqual((s.gpu_memory_fraction, s.max_reference_pixels), (0.5, 7340032))
 
     def test_preload_and_turbo(self):
         s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "QWEN_IMAGE_21_TURBO_PATH": self.tmp.name, "PRELOAD": "turbo, base"})
@@ -521,6 +524,9 @@ class TestConfig(unittest.TestCase):
             {"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "int4"},
             {"QWEN_IMAGE_21_PATH": self.base, "TEXT_ENCODER_PRECISION": "fp16"},
             {"QWEN_IMAGE_21_PATH": self.base, "TEXT_ENCODER_PRECISION": "fp8_dynamic"},
+            {"QWEN_IMAGE_21_PATH": self.base, "GPU_MEMORY_FRACTION": "half"},
+            {"QWEN_IMAGE_21_PATH": self.base, "GPU_MEMORY_FRACTION": "1.5"},
+            {"QWEN_IMAGE_21_PATH": self.base, "MAX_REFERENCE_PIXELS": "0"},
         ]:
             with self.subTest(env=env), self.assertRaises(ValueError):
                 load_settings(env)
@@ -568,6 +574,14 @@ class TestLoadPipeline(unittest.TestCase):
                     for name, cfg in mapping.items():
                         self.assertIs(type(cfg), kinds[name])
                         self.assertIsInstance(cfg.quant_type, quant_types[want[name]])
+
+    def test_reference_side(self):
+        from imagegen.engine import qwen
+
+        self.assertEqual(qwen.reference_side(0, 7 * 1024**2), 1024)
+        self.assertEqual(qwen.reference_side(7, 7 * 1024**2), 1024)
+        self.assertEqual(qwen.reference_side(10, 7 * 1024**2), 832)
+        self.assertEqual(qwen.reference_side(10, 10 * 1024**2), 1024)
 
     def test_shared_text_encoder_not_quantized(self):
         shared = {"text_encoder": object(), "vae": object(), "processor": object()}
