@@ -6,7 +6,8 @@ import os
 from dataclasses import dataclass
 
 DEVICES = ("auto", "mps", "cuda", "cpu")
-PRECISIONS = ("bf16", "int8")
+PRECISIONS = ("bf16", "int8", "fp8", "fp8_dynamic")
+TEXT_ENCODER_PRECISIONS = ("bf16", "int8", "fp8")  # fp8_dynamic's quantized activations would reach rendered text first
 
 
 @dataclass(frozen=True)
@@ -53,10 +54,10 @@ def _positive(env, key: str, default: int) -> int:
     return value
 
 
-def _precision(env, key: str) -> str:
+def _precision(env, key: str, choices: tuple[str, ...]) -> str:
     value = env.get(key, "").strip() or "bf16"
-    if value not in PRECISIONS:
-        raise ValueError(f"{key} must be one of {', '.join(PRECISIONS)}, got {value!r}")
+    if value not in choices:
+        raise ValueError(f"{key} must be one of {', '.join(choices)}, got {value!r}")
     return value
 
 
@@ -87,8 +88,8 @@ def load_settings(env=os.environ) -> Settings:
         max_queued=_positive(env, "MAX_QUEUED", 64),
         task_ttl=_positive(env, "TASK_TTL", 3600),
         db_path=os.path.abspath(os.path.expanduser(env.get("DB_PATH", "").strip() or "data/imagegen.sqlite3")),
-        transformer_precision=_precision(env, "TRANSFORMER_PRECISION"),
-        text_encoder_precision=_precision(env, "TEXT_ENCODER_PRECISION"),
+        transformer_precision=_precision(env, "TRANSFORMER_PRECISION", PRECISIONS),
+        text_encoder_precision=_precision(env, "TEXT_ENCODER_PRECISION", TEXT_ENCODER_PRECISIONS),
     )
     for name in settings.preload:
         if name not in settings.model_paths:

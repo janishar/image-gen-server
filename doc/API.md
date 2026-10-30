@@ -131,7 +131,8 @@ This shows which models are configured and loaded, and how busy the queue is.
 
 `queued` is the number of tasks waiting, `busy` is whether the worker is rendering or loading a `PRELOAD` model, and `tasks` is the number of tasks
 stored, including finished ones. Use `models.<name>.configured` to decide which models to offer. `precision` is the
-weight precision the server loads the transformer and text encoder in, `bf16` or `int8`, the same for every model.
+weight precision the server loads the transformer and text encoder in, `bf16`, `int8`, `fp8` or `fp8_dynamic`
+(transformer only), the same for every model.
 
 ## Size
 
@@ -174,7 +175,8 @@ These were measured on an Apple M-series Mac with 64 GB of memory:
 
 These times are for `bf16`. With `int8` (see `precision` in `/health`), the transformer takes about half the memory
 and the text encoder about 57% (13 GB less with both, measured with Turbo), renders are about 15% slower, and images
-change slightly for the same seed (fine texture only).
+change slightly for the same seed (fine texture only). `fp8` and `fp8_dynamic` should take the same memory as `int8`,
+but no full render has been measured with them yet.
 
 A task's total wait is its own render plus every render queued ahead of it. With many tasks in flight that can be
 tens of minutes, so set client deadlines with that in mind (see below).

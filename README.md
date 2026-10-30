@@ -17,8 +17,8 @@ uv run --env-file .env image-gen-server
 | `QWEN_IMAGE_21_PATH` | required | Qwen-Image-2.1 model directory |
 | `QWEN_IMAGE_21_TURBO_PATH` | unset | Qwen-Image-2.1-Turbo model directory (turbo off if unset) |
 | `QWEN_IMAGE_21_DEVICE` | `auto` | `auto`, `mps`, `cuda` or `cpu` (auto: MPS, else CUDA, else CPU) |
-| `TRANSFORMER_PRECISION` | `bf16` | `bf16` or `int8`: transformer weights, quantized while loading (no converted copy on disk) |
-| `TEXT_ENCODER_PRECISION` | `bf16` | `bf16` or `int8`: text encoder weights, same as above (the VAE always stays `bf16`) |
+| `TRANSFORMER_PRECISION` | `bf16` | `bf16`, `int8`, `fp8` or `fp8_dynamic`: transformer weights, quantized while loading (no converted copy on disk). `fp8_dynamic` also quantizes activations and uses the FP8 matmul; it needs a CUDA GPU with FP8 support |
+| `TEXT_ENCODER_PRECISION` | `bf16` | `bf16`, `int8` or `fp8`: text encoder weights, same as above (the VAE always stays `bf16`) |
 | `HOST` | `127.0.0.1` | Bind address |
 | `PORT` | `8740` | Port |
 | `PRELOAD` | empty | Comma list of models to load at startup, e.g. `turbo` or `base,turbo` |

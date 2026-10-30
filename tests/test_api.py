@@ -479,6 +479,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("bf16", "bf16"))
         s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "int8", "TEXT_ENCODER_PRECISION": " int8 "})
         self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("int8", "int8"))
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "fp8_dynamic", "TEXT_ENCODER_PRECISION": "fp8"})
+        self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("fp8_dynamic", "fp8"))
 
     def test_preload_and_turbo(self):
         s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "QWEN_IMAGE_21_TURBO_PATH": self.tmp.name, "PRELOAD": "turbo, base"})
@@ -497,6 +499,7 @@ class TestConfig(unittest.TestCase):
             {"QWEN_IMAGE_21_PATH": self.base, "TASK_TTL": "1h"},
             {"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "int4"},
             {"QWEN_IMAGE_21_PATH": self.base, "TEXT_ENCODER_PRECISION": "fp16"},
+            {"QWEN_IMAGE_21_PATH": self.base, "TEXT_ENCODER_PRECISION": "fp8_dynamic"},
         ]:
             with self.subTest(env=env), self.assertRaises(ValueError):
                 load_settings(env)
@@ -518,23 +521,32 @@ class TestLoadPipeline(unittest.TestCase):
         import diffusers
         import torch
         import transformers
-        from torchao.quantization import Int8WeightOnlyConfig
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            Float8WeightOnlyConfig,
+            Int8WeightOnlyConfig,
+        )
 
         kinds = {"transformer": diffusers.TorchAoConfig, "text_encoder": transformers.TorchAoConfig}
-        for t in ("bf16", "int8"):
-            for te in ("bf16", "int8"):
+        quant_types = {
+            "int8": Int8WeightOnlyConfig,
+            "fp8": Float8WeightOnlyConfig,
+            "fp8_dynamic": Float8DynamicActivationFloat8WeightConfig,
+        }
+        for t in ("bf16", *quant_types):
+            for te in ("bf16", "int8", "fp8"):
                 with self.subTest(transformer=t, text_encoder=te):
                     kw = self.load(transformer=t, text_encoder=te)
                     self.assertEqual((kw["dtype"], kw["device_map"]), (torch.bfloat16, "mps"))
-                    want = {n for n, p in (("transformer", t), ("text_encoder", te)) if p == "int8"}
+                    want = {n: p for n, p in (("transformer", t), ("text_encoder", te)) if p != "bf16"}
                     if not want:
                         self.assertNotIn("quantization_config", kw)
                         continue
                     mapping = kw["quantization_config"].quant_mapping
-                    self.assertEqual(set(mapping), want)
+                    self.assertEqual(set(mapping), set(want))
                     for name, cfg in mapping.items():
                         self.assertIs(type(cfg), kinds[name])
-                        self.assertIsInstance(cfg.quant_type, Int8WeightOnlyConfig)
+                        self.assertIsInstance(cfg.quant_type, quant_types[want[name]])
 
     def test_shared_text_encoder_not_quantized(self):
         shared = {"text_encoder": object(), "vae": object(), "processor": object()}
@@ -543,6 +555,8 @@ class TestLoadPipeline(unittest.TestCase):
         self.assertEqual(set(kw["quantization_config"].quant_mapping), {"transformer"})
         kw = self.load(shared, transformer="bf16", text_encoder="int8")
         self.assertNotIn("quantization_config", kw)
+        kw = self.load(shared, transformer="fp8", text_encoder="fp8")
+        self.assertEqual(set(kw["quantization_config"].quant_mapping), {"transformer"})
 
 
 class TestSchemas(unittest.TestCase):

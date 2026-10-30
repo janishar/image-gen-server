@@ -31,21 +31,31 @@ def noise_seed(seed: int, images: list[Image.Image] | None) -> int:
 def load_pipeline(path: str, device: str, shared: dict | None = None, transformer: str = "bf16", text_encoder: str = "bf16"):
     """A QwenImage21Pipeline from `path`, reusing already-loaded `shared` components instead of loading them again.
 
-    `transformer`/`text_encoder` are "bf16" or "int8"; int8 quantizes each Linear weight as it loads (nothing saved).
+    `transformer`/`text_encoder` are "bf16", "int8", "fp8" or "fp8_dynamic"; each quantizes the Linear weights as they
+    load (nothing saved). int8 and fp8 run in bf16; fp8_dynamic also quantizes activations and uses the FP8 matmul.
     """
     from diffusers import QwenImage21Pipeline  # type: ignore[import-not-found]
 
     kwargs = dict(shared or {})
     mapping = {}
-    if "int8" in (transformer, text_encoder):
+    if (transformer, text_encoder) != ("bf16", "bf16"):
         import diffusers
         import transformers
-        from torchao.quantization import Int8WeightOnlyConfig
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            Float8WeightOnlyConfig,
+            Int8WeightOnlyConfig,
+        )
 
-        if transformer == "int8":
-            mapping["transformer"] = diffusers.TorchAoConfig(Int8WeightOnlyConfig())
-        if text_encoder == "int8" and "text_encoder" not in kwargs:  # a shared one is already loaded as it is
-            mapping["text_encoder"] = transformers.TorchAoConfig(Int8WeightOnlyConfig())
+        configs = {
+            "int8": Int8WeightOnlyConfig,
+            "fp8": Float8WeightOnlyConfig,
+            "fp8_dynamic": Float8DynamicActivationFloat8WeightConfig,
+        }
+        if transformer != "bf16":
+            mapping["transformer"] = diffusers.TorchAoConfig(configs[transformer]())
+        if text_encoder != "bf16" and "text_encoder" not in kwargs:  # a shared one is already loaded as it is
+            mapping["text_encoder"] = transformers.TorchAoConfig(configs[text_encoder]())
     if mapping:
         from diffusers.quantizers import PipelineQuantizationConfig
 
