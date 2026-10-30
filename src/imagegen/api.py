@@ -1,7 +1,11 @@
-"""The HTTP API: submit a render task, poll it, download its image; GET /health reports models and queue."""
+"""The HTTP API: submit a render task, poll it, download its image; GET /health reports models and queue.
+
+Every route but GET /health needs `Authorization: Bearer <IMAGEGEN_API_KEY>`.
+"""
 
 from __future__ import annotations
 
+import hmac
 import io
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,8 +48,9 @@ def png_render(registry):
     return render
 
 
-def make_server(host: str, port: int, tasks: TaskStore, registry) -> ThreadingHTTPServer:
+def make_server(host: str, port: int, tasks: TaskStore, registry, api_key: str) -> ThreadingHTTPServer:
     """A threaded server in front of `tasks`; `registry` validates model names and reports status."""
+    bearer = f"Bearer {api_key}".encode()
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 60  # socket reads only: a stalled upload frees its thread
@@ -63,6 +68,14 @@ def make_server(host: str, port: int, tasks: TaskStore, registry) -> ThreadingHT
         def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:
             self.close_connection = True
             self.send_json(code, {"error": message or explain or "error"})
+
+        def authorized(self) -> bool:
+            """True for the right key; otherwise answers 401. The body stays unread, so the connection closes."""
+            if hmac.compare_digest(self.headers.get("Authorization", "").encode(), bearer):
+                return True
+            self.close_connection = True
+            self.send_json(401, {"error": "missing or invalid API key"}, {"WWW-Authenticate": "Bearer"})
+            return False
 
         def refuse(self, e: Exception) -> None:
             if isinstance(e, QueueFull):
@@ -84,6 +97,8 @@ def make_server(host: str, port: int, tasks: TaskStore, registry) -> ThreadingHT
             path = url.path  # a cache-buster query must not turn a live task into a 404
             if path == "/health":
                 return self.send_json(200, {"device": registry.device, "precision": registry.precision, "models": registry.status(), **tasks.stats()})
+            if not self.authorized():
+                return
             if path == TASKS:
                 return self.send_json(405, {"error": "use POST"}, {"Allow": "POST"})
             route = self.task_path(path)
@@ -116,6 +131,8 @@ def make_server(host: str, port: int, tasks: TaskStore, registry) -> ThreadingHT
             self.wfile.write(data)
 
         def do_POST(self) -> None:
+            if not self.authorized():
+                return
             path = urlsplit(self.path).path
             if path != TASKS:
                 if path == "/health" or self.task_path(path):

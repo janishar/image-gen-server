@@ -22,6 +22,9 @@ from imagegen.jobs import TaskStore
 from imagegen.schemas import MODELS, GenerateRequest, ValidationError, dump_request, load_images, parse_request
 from imagegen.store import TaskDB
 
+KEY = "test-key-0123456789"
+AUTH = {"Authorization": f"Bearer {KEY}"}
+
 
 class FakeRegistry:
     device = "cpu"
@@ -79,7 +82,7 @@ class ServerCase(unittest.TestCase):
         self.registry = FakeRegistry(self.configured)
         self.now = [1000.0]
         self.tasks = TaskStore(png_render(self.registry), self.db_path, self.max_queued, ttl=60, clock=lambda: self.now[0])
-        self.server = make_server("127.0.0.1", 0, self.tasks, self.registry)
+        self.server = make_server("127.0.0.1", 0, self.tasks, self.registry, KEY)
         self.thread = threading.Thread(target=self.server.serve_forever, args=(0.05,), daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
@@ -90,9 +93,9 @@ class ServerCase(unittest.TestCase):
         self.server.server_close()
         self.tasks.shutdown()
 
-    def request(self, method, path, body=None, raw=None):
+    def request(self, method, path, body=None, raw=None, headers=None):
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
-        req = urllib.request.Request(self.base + path, data=data, method=method)
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers or AUTH)
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 return r.status, dict(r.headers), r.read()
@@ -152,12 +155,37 @@ class TestApi(ServerCase):
         self.assertEqual(self.registry.log, [])
         self.assertEqual(self.tasks.stats()["tasks"], 0)
 
+    def test_api_key_required(self):
+        task_id = self.submit({"prompt": "cat"})["task_id"]
+        self.wait(task_id, "COMPLETED")
+        before = json.loads(self.request("GET", "/health")[2])["tasks"]
+        for headers in ({"X-None": "1"}, {"Authorization": "Bearer wrong"}, {"Authorization": KEY},
+                        {"Authorization": f"Bearer {KEY}x"}, {"Authorization": "Bearer "}):
+            for method, path, body in (("POST", "/v1/tasks", {"prompt": "x"}), ("GET", f"/v1/tasks/{task_id}", None),
+                                       ("GET", f"/v1/tasks/{task_id}/image", None),
+                                       ("GET", f"/v1/tasks/{task_id}/image?format=jpeg", None), ("GET", "/v1/nope", None)):
+                with self.subTest(headers=headers, path=path):
+                    status, response, data = self.request(method, path, body, headers=headers)
+                    self.assertEqual(status, 401, data)
+                    self.assertEqual(response["WWW-Authenticate"], "Bearer")
+                    self.assertEqual(json.loads(data), {"error": "missing or invalid API key"})
+        self.assertEqual(json.loads(self.request("GET", "/health")[2])["tasks"], before)  # none of them queued a task
+        self.assertEqual(self.request("GET", "/health", headers={"X-None": "1"})[0], 200)  # open, for uptime checks
+
+    def test_settings_hide_api_key(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        settings = load_settings({"QWEN_IMAGE_21_PATH": tmp.name, "IMAGEGEN_API_KEY": f"  {KEY} "})
+        self.assertEqual(settings.api_key, KEY)
+        self.assertNotIn(KEY, repr(settings))
+
     def test_content_length(self):
         for headers, expected in [({}, 411), ({"Content-Length": "-5"}, 400), ({"Content-Length": "x"}, 400),
                                   ({"Content-Length": str(64 * 1024 * 1024 + 1)}, 413)]:
             with self.subTest(headers=headers):
                 conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
                 conn.putrequest("POST", "/v1/tasks")
+                conn.putheader("Authorization", AUTH["Authorization"])
                 for k, v in headers.items():
                     conn.putheader(k, v)
                 conn.endheaders()
@@ -488,45 +516,48 @@ class TestConfig(unittest.TestCase):
         os.mkdir(self.base)
 
     def test_defaults(self):
-        s = load_settings({"QWEN_IMAGE_21_PATH": self.base})
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY})
         self.assertEqual((s.device, s.host, s.port, s.preload), ("auto", "127.0.0.1", 8740, ()))
         self.assertEqual(s.model_paths, {"base": self.base})
         self.assertEqual((s.max_queued, s.task_ttl), (64, 3600))
         self.assertEqual(s.db_path, os.path.abspath("data/imagegen.sqlite3"))
-        self.assertEqual(load_settings({"QWEN_IMAGE_21_PATH": self.base, "DB_PATH": "~/x.db"}).db_path,
+        self.assertEqual(load_settings({"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "DB_PATH": "~/x.db"}).db_path,
                          os.path.expanduser("~/x.db"))
-        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "MAX_QUEUED": "8", "TASK_TTL": "60"})
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "MAX_QUEUED": "8", "TASK_TTL": "60"})
         self.assertEqual((s.max_queued, s.task_ttl), (8, 60))
         self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("bf16", "bf16"))
-        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "int8", "TEXT_ENCODER_PRECISION": " int8 "})
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "TRANSFORMER_PRECISION": "int8", "TEXT_ENCODER_PRECISION": " int8 "})
         self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("int8", "int8"))
-        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "fp8_dynamic", "TEXT_ENCODER_PRECISION": "fp8"})
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "TRANSFORMER_PRECISION": "fp8_dynamic", "TEXT_ENCODER_PRECISION": "fp8"})
         self.assertEqual((s.transformer_precision, s.text_encoder_precision), ("fp8_dynamic", "fp8"))
         self.assertEqual((s.gpu_memory_fraction, s.max_reference_pixels), (0, 10 * 1024**2))
-        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "GPU_MEMORY_FRACTION": "0.5", "MAX_REFERENCE_PIXELS": "7340032"})
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "GPU_MEMORY_FRACTION": "0.5", "MAX_REFERENCE_PIXELS": "7340032"})
         self.assertEqual((s.gpu_memory_fraction, s.max_reference_pixels), (0.5, 7340032))
 
     def test_preload_and_turbo(self):
-        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "QWEN_IMAGE_21_TURBO_PATH": self.tmp.name, "PRELOAD": "turbo, base"})
+        s = load_settings({"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "QWEN_IMAGE_21_TURBO_PATH": self.tmp.name, "PRELOAD": "turbo, base"})
         self.assertEqual(s.preload, ("turbo", "base"))
         self.assertEqual(set(s.model_paths), {"base", "turbo"})
 
     def test_errors(self):
         for env in [
             {},
-            {"QWEN_IMAGE_21_PATH": os.path.join(self.tmp.name, "missing")},
-            {"QWEN_IMAGE_21_PATH": self.base, "PRELOAD": "turbo"},
-            {"QWEN_IMAGE_21_PATH": self.base, "PRELOAD": "huge"},
-            {"QWEN_IMAGE_21_PATH": self.base, "QWEN_IMAGE_21_DEVICE": "tpu"},
-            {"QWEN_IMAGE_21_PATH": self.base, "PORT": "http"},
-            {"QWEN_IMAGE_21_PATH": self.base, "MAX_QUEUED": "0"},
-            {"QWEN_IMAGE_21_PATH": self.base, "TASK_TTL": "1h"},
-            {"QWEN_IMAGE_21_PATH": self.base, "TRANSFORMER_PRECISION": "int4"},
-            {"QWEN_IMAGE_21_PATH": self.base, "TEXT_ENCODER_PRECISION": "fp16"},
-            {"QWEN_IMAGE_21_PATH": self.base, "TEXT_ENCODER_PRECISION": "fp8_dynamic"},
-            {"QWEN_IMAGE_21_PATH": self.base, "GPU_MEMORY_FRACTION": "half"},
-            {"QWEN_IMAGE_21_PATH": self.base, "GPU_MEMORY_FRACTION": "1.5"},
-            {"QWEN_IMAGE_21_PATH": self.base, "MAX_REFERENCE_PIXELS": "0"},
+            {"QWEN_IMAGE_21_PATH": os.path.join(self.tmp.name, "missing"), "IMAGEGEN_API_KEY": KEY},
+            {"QWEN_IMAGE_21_PATH": self.base},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": "   "},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": "short"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "PRELOAD": "turbo"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "PRELOAD": "huge"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "QWEN_IMAGE_21_DEVICE": "tpu"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "PORT": "http"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "MAX_QUEUED": "0"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "TASK_TTL": "1h"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "TRANSFORMER_PRECISION": "int4"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "TEXT_ENCODER_PRECISION": "fp16"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "TEXT_ENCODER_PRECISION": "fp8_dynamic"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "GPU_MEMORY_FRACTION": "half"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "GPU_MEMORY_FRACTION": "1.5"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "MAX_REFERENCE_PIXELS": "0"},
         ]:
             with self.subTest(env=env), self.assertRaises(ValueError):
                 load_settings(env)

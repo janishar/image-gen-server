@@ -7,7 +7,8 @@ model loads on the first request that needs it and stays in memory until the ser
 SQLite, so waiting tasks and finished images survive a restart.
 
 - Base URL: `http://127.0.0.1:8740` by default (`HOST` and `PORT` change it).
-- There is no authentication, so keep the server on a private network.
+- Every request needs `Authorization: Bearer <IMAGEGEN_API_KEY>`, except `GET /health`. A missing or wrong key gets a
+  `401` with `{"error": "missing or invalid API key"}`. The server won't start without a key of 16+ characters.
 - Every JSON response has a `Content-Type: application/json` header. Errors always look like `{"error": "<message>"}`.
 
 ## Flow
@@ -214,6 +215,7 @@ tens of minutes, so set client deadlines with that in mind (see below).
 ```python
 import asyncio
 import base64
+import os
 import time
 from pathlib import Path
 
@@ -223,6 +225,7 @@ BASE_URL = "http://127.0.0.1:8740"
 MAX_REFERENCES = 10
 QUEUE_TIMEOUT = 3600.0   # s waiting as CREATED
 RENDER_TIMEOUT = 900.0   # s from started_at to finished
+HEADERS = {"Authorization": f"Bearer {os.environ['IMAGEGEN_API_KEY']}"}
 TRANSIENT = (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError)
 
 
@@ -277,7 +280,7 @@ async def generate(
         "seed": seed,
         "images": [base64.b64encode(p.read_bytes()).decode() for p in references[:MAX_REFERENCES]],
     }
-    async with httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+    async with httpx.AsyncClient(base_url=BASE_URL, headers=HEADERS, timeout=httpx.Timeout(60.0, connect=10.0)) as client:
         while True:
             resp = await client.post("/v1/tasks", json=body)
             if resp.status_code != 429:

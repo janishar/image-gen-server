@@ -46,7 +46,7 @@ def main() -> None:
     for name in settings.preload:
         tasks.preload(registry.get, name).add_done_callback(report)
     tasks.recover()  # after the preloads, before serving: the last run's waiting tasks queue ahead of new ones
-    server = make_server(settings.host, settings.port, tasks, registry)
+    server = make_server(settings.host, settings.port, tasks, registry, settings.api_key)
 
     def on_sigterm(signum, frame):
         raise KeyboardInterrupt

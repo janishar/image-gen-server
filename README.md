@@ -8,12 +8,13 @@ it is used and stays in memory until the server stops. Clients submit a task, po
 
 ```sh
 uv sync
-cp .env.example .env   # then edit the paths
+cp .env.example .env   # then edit the paths and set the key
 uv run --env-file .env image-gen-server
 ```
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `IMAGEGEN_API_KEY` | required | 16+ characters. Every route but `GET /health` needs `Authorization: Bearer <key>` |
 | `QWEN_IMAGE_21_PATH` | required | Qwen-Image-2.1 model directory |
 | `QWEN_IMAGE_21_TURBO_PATH` | unset | Qwen-Image-2.1-Turbo model directory (turbo off if unset) |
 | `QWEN_IMAGE_21_DEVICE` | `auto` | `auto`, `mps`, `cuda` or `cpu` (auto: MPS, else CUDA, else CPU) |
@@ -57,22 +58,23 @@ the same `DB_PATH` refuses to start (it holds `<DB_PATH>.lock`).
 
 ```sh
 # submit, poll, download
-id=$(curl -s localhost:8740/v1/tasks -d '{"prompt": "A neon shop sign that reads QWEN", "ratio": "16:9"}' \
+auth="Authorization: Bearer $IMAGEGEN_API_KEY"
+id=$(curl -s localhost:8740/v1/tasks -H "$auth" -d '{"prompt": "A neon shop sign that reads QWEN", "ratio": "16:9"}' \
   | python3 -c 'import json, sys; print(json.load(sys.stdin)["data"]["task_id"])')
 while :; do
-  status=$(curl -s localhost:8740/v1/tasks/$id | python3 -c 'import json, sys; print(json.load(sys.stdin)["data"]["status"])')
+  status=$(curl -s localhost:8740/v1/tasks/$id -H "$auth" | python3 -c 'import json, sys; print(json.load(sys.stdin)["data"]["status"])')
   echo "$status"
   case $status in COMPLETED|FAILED) break;; esac
   sleep 2
 done
-curl -sf localhost:8740/v1/tasks/$id/image -o base.png
+curl -sf localhost:8740/v1/tasks/$id/image -H "$auth" -o base.png
 
 # turbo
-curl -s localhost:8740/v1/tasks -d '{"prompt": "A corgi playing guitar in the rain", "model": "turbo"}'
+curl -s localhost:8740/v1/tasks -H "$auth" -d '{"prompt": "A corgi playing guitar in the rain", "model": "turbo"}'
 
 # edit
 python3 -c 'import base64, json, sys; json.dump({"prompt": "Make the sky a sunset", "images": [base64.b64encode(open(sys.argv[1], "rb").read()).decode()]}, sys.stdout)' photo.png > req.json
-curl -s localhost:8740/v1/tasks --data-binary @req.json
+curl -s localhost:8740/v1/tasks -H "$auth" --data-binary @req.json
 
 curl -s localhost:8740/health
 ```

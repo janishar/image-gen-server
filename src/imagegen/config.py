@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 DEVICES = ("auto", "mps", "cuda", "cpu")
 PRECISIONS = ("bf16", "int8", "fp8", "fp8_dynamic")
 TEXT_ENCODER_PRECISIONS = ("bf16", "int8", "fp8")  # fp8_dynamic's quantized activations would reach rendered text first
+MIN_API_KEY = 16
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class Settings:
     text_encoder_precision: str
     gpu_memory_fraction: float
     max_reference_pixels: int
+    api_key: str = field(repr=False)
 
     @property
     def model_paths(self) -> dict[str, str]:
@@ -74,6 +76,13 @@ def _fraction(env, key: str) -> float:
     return value
 
 
+def _api_key(env) -> str:
+    value = env.get("IMAGEGEN_API_KEY", "").strip()
+    if len(value) < MIN_API_KEY:
+        raise ValueError(f"IMAGEGEN_API_KEY is required: a random string of {MIN_API_KEY}+ characters")
+    return value
+
+
 def load_settings(env=os.environ) -> Settings:
     """Read and check the settings, raising ValueError on anything wrong."""
     base = _model_dir(env, "QWEN_IMAGE_21_PATH", required=True)
@@ -105,6 +114,7 @@ def load_settings(env=os.environ) -> Settings:
         text_encoder_precision=_precision(env, "TEXT_ENCODER_PRECISION", TEXT_ENCODER_PRECISIONS),
         gpu_memory_fraction=_fraction(env, "GPU_MEMORY_FRACTION"),
         max_reference_pixels=_positive(env, "MAX_REFERENCE_PIXELS", 10 * 1024**2),
+        api_key=_api_key(env),
     )
     for name in settings.preload:
         if name not in settings.model_paths:
