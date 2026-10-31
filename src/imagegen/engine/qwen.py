@@ -7,7 +7,8 @@ import hashlib
 import torch
 from PIL import Image
 
-from ..schemas import ASPECT_RATIOS, GenerateRequest
+from ..schemas import MODELS, GenerateRequest
+from .common import quant_config, reference_side
 
 SHARED = ("text_encoder", "vae", "processor")
 
@@ -41,21 +42,11 @@ def load_pipeline(path: str, device: str, shared: dict | None = None, transforme
     if (transformer, text_encoder) != ("bf16", "bf16"):
         import diffusers
         import transformers
-        from torchao.quantization import (
-            Float8DynamicActivationFloat8WeightConfig,
-            Float8WeightOnlyConfig,
-            Int8WeightOnlyConfig,
-        )
 
-        configs = {
-            "int8": Int8WeightOnlyConfig,
-            "fp8": Float8WeightOnlyConfig,
-            "fp8_dynamic": Float8DynamicActivationFloat8WeightConfig,
-        }
         if transformer != "bf16":
-            mapping["transformer"] = diffusers.TorchAoConfig(configs[transformer]())
+            mapping["transformer"] = quant_config(diffusers, transformer)
         if text_encoder != "bf16" and "text_encoder" not in kwargs:  # a shared one is already loaded as it is
-            mapping["text_encoder"] = transformers.TorchAoConfig(configs[text_encoder]())
+            mapping["text_encoder"] = quant_config(transformers, text_encoder)
     if mapping:
         from diffusers.quantizers import PipelineQuantizationConfig
 
@@ -91,14 +82,18 @@ def trim_vae(vae) -> None:
                       tile_sample_stride_height=768, tile_sample_stride_width=768)
 
 
-def reference_side(count: int, max_pixels: int) -> int:
-    """The pipeline's output_resolution for `count` references: 1024 unless their pixels would pass `max_pixels`."""
-    # ponytail: 4+ references with no size also shrink the output; ORA always sends a size
-    return min(1024, int((max_pixels / max(count, 1)) ** 0.5) // 32 * 32)
+def load(path: str, device: str, loaded: list, transformer: str, text_encoder: str):
+    """The pipeline at `path`, reusing the shared parts of `loaded`, the Qwen pipelines already in memory."""
+    other = next(iter(loaded), None)
+    pipe = load_pipeline(path, device, shared_components(other) if other else None, transformer, text_encoder)
+    if other is None and device == "cuda":  # the VAE is shared, so once
+        trim_vae(pipe.vae)
+    return pipe
 
 
-def render(pipe, req: GenerateRequest, on_step=None, max_reference_pixels: int = 10 * 1024**2) -> tuple[Image.Image, int]:
-    """Run `req` through `pipe`, calling on_step(done, total) after each step; returns the image and steps run."""
+def render(pipe, req: GenerateRequest, on_step=None, max_reference_pixels: int = 10 * 1024**2) -> tuple[Image.Image, int, None]:
+    """Run `req` through `pipe`, calling on_step(done, total) after each step; returns the image, the steps run and
+    no caption (only Klein writes one)."""
 
     def on_step_end(p, i: int, t, kwargs: dict) -> dict:
         print(f"@step {i + 1}/{p.num_timesteps}", flush=True)
@@ -108,7 +103,7 @@ def render(pipe, req: GenerateRequest, on_step=None, max_reference_pixels: int =
 
     images = list(req.images) or None
     ratio = req.ratio or (None if images else "1:1")
-    width, height = ASPECT_RATIOS[ratio] if ratio else (None, None)
+    width, height = MODELS[req.model].ratios[ratio] if ratio else (None, None)
     width, height = req.width or width, req.height or height
     prompt = req.prompt
     if req.transparent:
@@ -125,6 +120,7 @@ def render(pipe, req: GenerateRequest, on_step=None, max_reference_pixels: int =
         num_inference_steps=req.steps,
         generator=torch.Generator(device="cpu").manual_seed(noise_seed(req.seed, images)),
         callback_on_step_end=on_step_end,
+        # ponytail: a budget tight enough to shrink references also shrinks the output when no size is sent; ORA sends one
         output_resolution=reference_side(len(images or ()), max_reference_pixels),
     ).images[0]
-    return out, len(sigmas) if sigmas else req.steps
+    return out, len(sigmas) if sigmas else req.steps, None

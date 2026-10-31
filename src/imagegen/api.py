@@ -1,4 +1,5 @@
-"""The HTTP API: submit a render task, poll it, download its image; GET /health reports models and queue.
+"""The HTTP API: submit a render task, poll it, download its image; GET /health reports models and queue, and
+GET /v1/models what each model accepts.
 
 Every route but GET /health needs `Authorization: Bearer <IMAGEGEN_API_KEY>`.
 """
@@ -8,16 +9,18 @@ from __future__ import annotations
 import hmac
 import io
 import json
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from PIL import Image
 
 from .jobs import COMPLETED, Cancelled, QueueFull, TaskStore
-from .schemas import ValidationError, dump_request, load_images, parse_request
+from .schemas import MAX_IMAGES, MODELS, ValidationError, dump_request, load_images, parse_request
 
 MAX_BODY = 64 * 1024 * 1024
 TASKS = "/v1/tasks"
+MODEL_LIST = "/v1/models"
 IMAGE_FORMATS = ("png", "jpeg")
 JPEG_QUALITY = 92
 
@@ -39,13 +42,25 @@ def png_render(registry):
     inputs decoded, registry.render, PNG-encoded, all there, so request threads only copy bytes."""
 
     def render(data, on_step):
-        req = parse_request(data, registry.configured)
-        image, steps = registry.render(load_images(req), on_step)
+        req = parse_request(data, registry.configured, registry.can_upsample)
+        image, steps, caption = registry.render(load_images(req), on_step)
         buf = io.BytesIO()
         image.save(buf, format="PNG")
-        return buf.getvalue(), steps
+        return buf.getvalue(), steps, caption
 
     return render
+
+
+def model_views(registry) -> list[dict]:
+    """What each configured model accepts, for GET /v1/models."""
+    status = registry.status()
+    views = []
+    for name in registry.configured:
+        spec = asdict(MODELS[name])
+        spec["options"] = [o for o in spec["options"] if o != "upsample" or registry.can_upsample]
+        limits = {"max_images": MAX_IMAGES, "max_input_pixels": MODELS[name].max_input_pixels}
+        views.append({"id": name, "loaded": status[name]["loaded"], **limits, **spec})
+    return views
 
 
 def make_server(host: str, port: int, tasks: TaskStore, registry, api_key: str) -> ThreadingHTTPServer:
@@ -92,14 +107,23 @@ def make_server(host: str, port: int, tasks: TaskStore, registry, api_key: str) 
                     return parts[3], True
             return None
 
+        def model_path(self, path: str) -> str | None:
+            """The model of /v1/models/{model}/tasks, else None."""
+            parts = path.split("/")
+            if len(parts) == 5 and "/".join(parts[:3]) == MODEL_LIST and parts[3] and parts[4] == "tasks":
+                return parts[3]
+            return None
+
         def do_GET(self) -> None:
             url = urlsplit(self.path)
             path = url.path  # a cache-buster query must not turn a live task into a 404
             if path == "/health":
-                return self.send_json(200, {"device": registry.device, "precision": registry.precision, "models": registry.status(), **tasks.stats()})
+                return self.send_json(200, {"device": registry.device, "precision": registry.precision, "models": registry.status(), "upsampler": registry.upsampler_status(), **tasks.stats()})
             if not self.authorized():
                 return
-            if path == TASKS:
+            if path == MODEL_LIST:
+                return self.send_json(200, {"data": model_views(registry)})
+            if path == TASKS or self.model_path(path):
                 return self.send_json(405, {"error": "use POST"}, {"Allow": "POST"})
             route = self.task_path(path)
             if route is None:
@@ -134,10 +158,14 @@ def make_server(host: str, port: int, tasks: TaskStore, registry, api_key: str) 
             if not self.authorized():
                 return
             path = urlsplit(self.path).path
-            if path != TASKS:
-                if path == "/health" or self.task_path(path):
+            model = self.model_path(path)
+            if path != TASKS and model is None:
+                if path in ("/health", MODEL_LIST) or self.task_path(path):
                     return self.send_json(405, {"error": "use GET"}, {"Allow": "GET"})
                 return self.send_json(404, {"error": "not found"})
+            if model is not None and model not in registry.configured:
+                self.close_connection = True  # the unread body would be parsed as the next request
+                return self.send_json(404, {"error": f"model {model!r} is not configured"})
             length = self.headers.get("Content-Length")
             if length is None:
                 return self.send_json(411, {"error": "Content-Length required"})
@@ -156,7 +184,10 @@ def make_server(host: str, port: int, tasks: TaskStore, registry, api_key: str) 
                 self.close_connection = True
                 return self.refuse(e)
             try:
-                req = parse_request(json.loads(self.rfile.read(size)), registry.configured)
+                data = json.loads(self.rfile.read(size))
+                if model is not None and isinstance(data, dict):
+                    data = {**data, "model": model}  # the URL wins over a `model` in the body
+                req = parse_request(data, registry.configured, registry.can_upsample)
             except ValidationError as e:
                 return self.send_json(400, {"error": str(e)})
             except (ValueError, RecursionError) as e:  # JSONDecodeError, UnicodeDecodeError, int digit limit, nesting

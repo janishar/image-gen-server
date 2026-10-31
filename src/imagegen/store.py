@@ -8,7 +8,7 @@ import threading
 
 CREATED, IN_PROGRESS, COMPLETED, FAILED = "CREATED", "IN_PROGRESS", "COMPLETED", "FAILED"
 
-# ponytail: one fixed schema, no migrations; changing it needs a migration (or deleting the db file)
+# ponytail: new columns go in by hand in TaskDB.__init__; anything bigger needs a real migration (or deleting the db file)
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -24,13 +24,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     steps INTEGER,
     error TEXT,
     image BLOB,
-    steps_run INTEGER
+    steps_run INTEGER,
+    caption TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_status_seq ON tasks (status, seq);
 CREATE INDEX IF NOT EXISTS tasks_finished_at ON tasks (finished_at);
 """
 
-_VIEW = f"""SELECT id, status, model, seed, created_at, started_at, finished_at, step, steps, error,
+_VIEW = f"""SELECT id, status, model, seed, created_at, started_at, finished_at, step, steps, error, caption,
     CASE WHEN status = '{CREATED}' THEN
         (SELECT COUNT(*) FROM tasks q WHERE q.status = '{CREATED}' AND q.seq < tasks.seq) END AS position
 FROM tasks WHERE id = ?"""
@@ -50,6 +51,8 @@ class TaskDB:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
+        if "caption" not in [c["name"] for c in self._conn.execute("PRAGMA table_info(tasks)")]:  # a db from before captions
+            self._conn.execute("ALTER TABLE tasks ADD COLUMN caption TEXT")
 
     def _exec(self, sql: str, args=()) -> list[sqlite3.Row]:
         with self._lock:  # rows fetched under the lock too: the cursor shares the connection
@@ -74,10 +77,11 @@ class TaskDB:
     def set_step(self, task_id: str, step: int, steps: int) -> None:
         self._exec("UPDATE tasks SET step = ?, steps = ? WHERE id = ? AND status = ?", (step, steps, task_id, IN_PROGRESS))
 
-    def set_finished(self, task_id: str, now: float, image: bytes | None, steps_run: int | None, error: str | None) -> None:
-        self._exec("UPDATE tasks SET status = ?, finished_at = ?, image = ?, steps_run = ?, error = ?, request = NULL"
-                   " WHERE id = ? AND status = ?",
-                   (FAILED if error else COMPLETED, now, image, steps_run, error, task_id, IN_PROGRESS))
+    def set_finished(self, task_id: str, now: float, image: bytes | None, steps_run: int | None, error: str | None,
+                     caption: str | None = None) -> None:
+        self._exec("UPDATE tasks SET status = ?, finished_at = ?, image = ?, steps_run = ?, error = ?, caption = ?,"
+                   " request = NULL WHERE id = ? AND status = ?",
+                   (FAILED if error else COMPLETED, now, image, steps_run, error, caption, task_id, IN_PROGRESS))
 
     def get(self, task_id: str) -> dict | None:
         """The task's fields (no request or image) plus `position` among CREATED tasks."""

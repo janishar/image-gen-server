@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import urllib.error
@@ -16,7 +17,7 @@ import urllib.request
 
 from PIL import Image
 
-from imagegen.api import make_server, png_render, to_jpeg
+from imagegen.api import make_server, model_views, png_render, to_jpeg
 from imagegen.config import load_settings
 from imagegen.jobs import TaskStore
 from imagegen.schemas import MODELS, GenerateRequest, ValidationError, dump_request, load_images, parse_request
@@ -30,8 +31,9 @@ class FakeRegistry:
     device = "cpu"
     precision = {"transformer": "int8", "text_encoder": "bf16"}
 
-    def __init__(self, configured=("base", "turbo")):
+    def __init__(self, configured=tuple(MODELS), can_upsample=True):
         self.configured = configured
+        self.can_upsample = can_upsample
         self.log = []  # (event, prompt)
         self.active = 0
         self.max_active = 0
@@ -40,6 +42,9 @@ class FakeRegistry:
 
     def status(self):
         return {n: {"configured": n in self.configured, "loaded": False} for n in MODELS}
+
+    def upsampler_status(self):
+        return {"configured": self.can_upsample, "loaded": False}
 
     def render(self, req: GenerateRequest, on_step=None):
         with self.lock:
@@ -55,7 +60,8 @@ class FakeRegistry:
             if req.prompt == "boom":
                 raise RuntimeError("kaput")
             on_step(4, 4)
-            return Image.new("RGB", (8, 8), "red"), 8 if req.model == "turbo" else req.steps
+            caption = f"caption of {req.prompt}" if req.upsample else None
+            return Image.new("RGB", (8, 8), "red"), 8 if req.model == "turbo" else req.steps, caption
         finally:
             with self.lock:
                 self.active -= 1
@@ -72,14 +78,15 @@ def b64png(size=(4, 4), corrupt_at=None) -> str:
 
 
 class ServerCase(unittest.TestCase):
-    configured = ("base", "turbo")
+    configured = tuple(MODELS)
+    can_upsample = True
     max_queued = 64
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.db_path = os.path.join(tmp.name, "data", "tasks.sqlite3")
-        self.registry = FakeRegistry(self.configured)
+        self.registry = FakeRegistry(self.configured, self.can_upsample)
         self.now = [1000.0]
         self.tasks = TaskStore(png_render(self.registry), self.db_path, self.max_queued, ttl=60, clock=lambda: self.now[0])
         self.server = make_server("127.0.0.1", 0, self.tasks, self.registry, KEY)
@@ -119,15 +126,20 @@ class ServerCase(unittest.TestCase):
             time.sleep(0.01)
         return t
 
-
-class TestApi(ServerCase):
-    def assert400(self, body, raw=None):
-        status, headers, data = self.request("POST", "/v1/tasks", body, raw)
+    def assert400(self, body, raw=None, path="/v1/tasks"):
+        status, headers, data = self.request("POST", path, body, raw)
         self.assertEqual(status, 400, data)
         self.assertIn("error", json.loads(data))
         self.assertEqual(headers["Content-Type"], "application/json")
         return json.loads(data)["error"]
 
+    def models(self):
+        status, _, data = self.request("GET", "/v1/models")
+        self.assertEqual(status, 200, data)
+        return {m["id"]: m for m in json.loads(data)["data"]}
+
+
+class TestApi(ServerCase):
     def test_bad_requests(self):
         for body in [
             {"prompt": ""},
@@ -155,6 +167,32 @@ class TestApi(ServerCase):
         self.assertEqual(self.registry.log, [])
         self.assertEqual(self.tasks.stats()["tasks"], 0)
 
+    def test_bad_requests_per_model(self):
+        for fields, error in [
+            ({"model": "klein", "height": 72}, "height must be an integer in 64..4096, a multiple of 16"),
+            ({"model": "klein", "width": 4112}, "width must be an integer in 64..4096, a multiple of 16"),
+            ({"model": "turbo", "width": 4096}, "width must be an integer in 256..2752, a multiple of 32"),
+            ({"model": "turbo", "width": 1040}, "width must be an integer in 256..2752, a multiple of 32"),
+            ({"model": "klein", "ratio": "5:4"}, "ratio must be one of"),
+            ({"model": "base", "ratio": "5:4"}, "ratio must be one of"),
+            ({"model": "klein", "transparent": True}, "model 'klein' has no transparent option"),
+            ({"model": "turbo", "upsample": True}, "model 'turbo' has no upsample option"),
+            ({"model": "base", "upsample": True}, "model 'base' has no upsample option"),
+            ({"model": "klein", "upsample": "yes"}, "upsample must be a boolean"),
+            ({"model": "klein", "upsample": 1}, "upsample must be a boolean"),
+            ({"model": "turbo", "transparent": "yes"}, "transparent must be a boolean"),
+            ({"model": "klein", "transparent": None}, "transparent must be a boolean"),
+            ({"model": ["klein"]}, "model must be one of"),
+            ({"model": {"klein": 1}}, "model must be one of"),
+            ({"model": None}, "model must be one of"),
+            ({"model": "huge"}, "model must be one of"),
+            ({"model": "klein", "steps": 101}, "steps must be an integer in 1..100"),
+            ({"model": "klein", "images": [b64png((8192, 4097))]}, "over 33554432 pixels"),
+        ]:
+            with self.subTest(fields=str(fields)[:80]):
+                self.assertIn(error, self.assert400({"prompt": "x", **fields}))
+        self.assertEqual(self.tasks.stats()["tasks"], 0)
+
     def test_api_key_required(self):
         task_id = self.submit({"prompt": "cat"})["task_id"]
         self.wait(task_id, "COMPLETED")
@@ -163,7 +201,10 @@ class TestApi(ServerCase):
                         {"Authorization": f"Bearer {KEY}x"}, {"Authorization": "Bearer "}):
             for method, path, body in (("POST", "/v1/tasks", {"prompt": "x"}), ("GET", f"/v1/tasks/{task_id}", None),
                                        ("GET", f"/v1/tasks/{task_id}/image", None),
-                                       ("GET", f"/v1/tasks/{task_id}/image?format=jpeg", None), ("GET", "/v1/nope", None)):
+                                       ("GET", f"/v1/tasks/{task_id}/image?format=jpeg", None), ("GET", "/v1/nope", None),
+                                       ("GET", "/v1/models", None), ("GET", "/v1/models/klein/tasks", None),
+                                       ("POST", "/v1/models/klein/tasks", {"prompt": "x"}),
+                                       ("POST", "/v1/models/nope/tasks", {"prompt": "x"})):
                 with self.subTest(headers=headers, path=path):
                     status, response, data = self.request(method, path, body, headers=headers)
                     self.assertEqual(status, 401, data)
@@ -221,6 +262,24 @@ class TestApi(ServerCase):
         status, headers, _ = self.request("GET", f"/v1/tasks/{task_id}/image")
         self.assertEqual(status, 200)
         self.assertEqual((headers["X-Model"], headers["X-Steps"]), ("turbo", "8"))
+
+    def test_klein_steps_cut(self):
+        for fields, steps in (({"steps": 40}, "16"), ({}, "16"), ({"steps": 8}, "8")):
+            with self.subTest(fields=fields):
+                task_id = self.submit({"prompt": "cat", "model": "klein", **fields})["task_id"]
+                self.wait(task_id, "COMPLETED")
+                _, headers, _ = self.request("GET", f"/v1/tasks/{task_id}/image")
+                self.assertEqual((headers["X-Model"], headers["X-Steps"]), ("klein", steps))
+
+    def test_caption(self):
+        task_id = self.submit({"prompt": "cat", "model": "klein", "upsample": True})["task_id"]
+        self.assertEqual(self.wait(task_id, "COMPLETED")["caption"], "caption of cat")
+        for fields in ({"model": "klein"}, {"model": "klein", "upsample": False}, {"model": "turbo"}):
+            with self.subTest(fields=fields):
+                task_id = self.submit({"prompt": "cat", **fields})["task_id"]
+                self.assertIsNone(self.wait(task_id, "COMPLETED")["caption"])
+        task_id = self.submit({"prompt": "boom", "model": "klein", "upsample": True})["task_id"]
+        self.assertIsNone(self.wait(task_id, "FAILED")["caption"])
 
     def test_progress_and_image_before_done(self):
         task_id = self.submit({"prompt": "hold"})["task_id"]
@@ -305,7 +364,12 @@ class TestApi(ServerCase):
             {
                 "device": "cpu",
                 "precision": {"transformer": "int8", "text_encoder": "bf16"},
-                "models": {"base": {"configured": True, "loaded": False}, "turbo": {"configured": True, "loaded": False}},
+                "models": {
+                    "base": {"configured": True, "loaded": False},
+                    "turbo": {"configured": True, "loaded": False},
+                    "klein": {"configured": True, "loaded": False},
+                },
+                "upsampler": {"configured": True, "loaded": False},
                 "queued": 0,
                 "busy": False,
                 "tasks": 0,
@@ -321,7 +385,10 @@ class TestApi(ServerCase):
         for method, path, expected in [("GET", "/nope", 404), ("POST", "/nope", 404), ("GET", "/generate", 404),
                                        ("POST", "/generate", 404), ("GET", "/v1/tasks/x/y", 404),
                                        ("GET", "/v1/tasks/", 404), ("GET", "/v1/tasks", 405),
-                                       ("POST", "/v1/tasks/x", 405), ("POST", "/health", 405)]:
+                                       ("POST", "/v1/tasks/x", 405), ("POST", "/health", 405),
+                                       ("POST", "/v1/models", 405), ("GET", "/v1/models/klein/tasks", 405),
+                                       ("GET", "/v1/models/klein", 404), ("POST", "/v1/models/klein", 404),
+                                       ("POST", "/v1/models/klein/tasks/x", 404), ("POST", "/v1/models//tasks", 404)]:
             with self.subTest(method=method, path=path):
                 status, headers, data = self.request(method, path, {} if method == "POST" else None)
                 self.assertEqual(status, expected)
@@ -359,6 +426,94 @@ class TestApi(ServerCase):
         self.assertEqual([p for e, p in registry.log if e == "start"], ["p0", "p1"])
 
 
+class TestModels(ServerCase):
+    def test_lists_models_with_limits(self):
+        models = self.models()
+        self.assertEqual(list(models), ["base", "turbo", "klein"])
+        self.assertEqual(models["klein"], {
+            "id": "klein", "loaded": False, "max_images": 10, "max_input_pixels": 33554432, "family": "klein",
+            "ratios": {name: list(size) for name, size in MODELS["klein"].ratios.items()},
+            "min_side": 64, "max_side": 4096, "side_multiple": 16, "steps": 16, "max_steps": 16, "options": ["upsample"],
+        })
+        self.assertEqual(models["klein"]["ratios"]["16:9"], [1360, 768])
+        turbo = models["turbo"]
+        self.assertEqual((turbo["family"], turbo["min_side"], turbo["max_side"], turbo["side_multiple"]), ("qwen", 256, 2752, 32))
+        self.assertEqual((turbo["steps"], turbo["max_steps"], turbo["options"]), (40, 100, ["transparent"]))
+        self.assertEqual(turbo["ratios"]["16:9"], [2752, 1536])
+
+    def test_model_route(self):
+        status, _, data = self.request("POST", "/v1/models/klein/tasks", {"prompt": "cat", "upsample": True})
+        self.assertEqual(status, 202, data)
+        created = json.loads(data)["data"]
+        self.assertEqual(set(created), {"task_id", "status", "position"})
+        done = self.wait(created["task_id"], "COMPLETED")
+        self.assertEqual((done["model"], done["caption"]), ("klein", "caption of cat"))
+
+    def test_url_overrides_body_model(self):
+        for model in ("turbo", "huge", ["klein"], None):
+            with self.subTest(model=model):
+                status, _, data = self.request("POST", "/v1/models/klein/tasks", {"prompt": "cat", "model": model})
+                self.assertEqual(status, 202, data)
+                self.assertEqual(self.wait(json.loads(data)["data"]["task_id"], "COMPLETED")["model"], "klein")
+        error = self.assert400({"prompt": "x", "model": "klein", "upsample": True}, path="/v1/models/turbo/tasks")
+        self.assertEqual(error, "model 'turbo' has no upsample option")  # the URL's model is the one validated
+
+    def test_unknown_model_404(self):
+        status, _, data = self.request("POST", "/v1/models/huge/tasks", {"prompt": "x"})
+        self.assertEqual((status, json.loads(data)["error"]), (404, "model 'huge' is not configured"))
+
+    def test_405_allow(self):
+        self.assertEqual(self.request("GET", "/v1/models/klein/tasks")[1]["Allow"], "POST")
+        self.assertEqual(self.request("POST", "/v1/models", {})[1]["Allow"], "GET")
+
+    def test_bad_bodies_400(self):
+        path = "/v1/models/klein/tasks"
+        for body in (["prompt"], "cat", 7, None):
+            with self.subTest(body=body):
+                error = self.assert400(None, raw=json.dumps(body).encode(), path=path)
+                self.assertEqual(error, "request body must be a JSON object")
+        self.assertIn("invalid JSON", self.assert400(None, raw=b"{not json", path=path))
+        self.assertEqual(self.tasks.stats()["tasks"], 0)
+
+
+class TestNoUpsampler(ServerCase):
+    can_upsample = False
+
+    def test_upsample_refused(self):
+        error = self.assert400({"prompt": "x", "model": "klein", "upsample": True})
+        self.assertEqual(error, "the prompt upsampler is not configured")
+        self.wait(self.submit({"prompt": "x", "model": "klein", "upsample": False})["task_id"], "COMPLETED")
+        self.assertEqual(self.registry.log[0], ("start", "x"))
+
+    def test_views_hide_upsample(self):
+        models = self.models()
+        self.assertEqual(models["klein"]["options"], [])
+        self.assertEqual(models["turbo"]["options"], ["transparent"])
+        self.assertEqual(MODELS["klein"].options, ("upsample",))  # the shared table untouched
+        health = json.loads(self.request("GET", "/health")[2])
+        self.assertEqual(health["upsampler"], {"configured": False, "loaded": False})
+
+
+class TestKleinOnly(ServerCase):
+    configured = ("klein",)
+
+    def test_default_model(self):
+        done = self.wait(self.submit({"prompt": "cat"})["task_id"], "COMPLETED")
+        self.assertEqual(done["model"], "klein")
+        _, headers, _ = self.request("GET", f"/v1/tasks/{done['task_id']}/image")
+        self.assertEqual(headers["X-Steps"], "16")
+
+    def test_only_klein_served(self):
+        self.assertEqual(list(self.models()), ["klein"])
+        for model in ("base", "turbo"):
+            with self.subTest(model=model):
+                status, _, data = self.request("POST", f"/v1/models/{model}/tasks", {"prompt": "x"})
+                self.assertEqual((status, json.loads(data)["error"]), (404, f"model {model!r} is not configured"))
+        models = json.loads(self.request("GET", "/health")[2])["models"]
+        self.assertEqual({n for n, m in models.items() if m["configured"]}, {"klein"})
+        self.assertEqual(set(models), {"base", "turbo", "klein"})
+
+
 class TestQueueFull(ServerCase):
     max_queued = 2
 
@@ -383,11 +538,18 @@ class TestBaseOnly(ServerCase):
         self.assertEqual(status, 400)
         self.assertEqual(json.loads(data)["error"], "model 'turbo' is not configured")
 
+    def test_default_model(self):
+        self.assertEqual(self.wait(self.submit({"prompt": "cat"})["task_id"], "COMPLETED")["model"], "base")
+
+    def test_only_base_served(self):
+        self.assertEqual(list(self.models()), ["base"])
+        self.assertEqual(self.request("POST", "/v1/models/klein/tasks", {"prompt": "x"})[0], 404)
+
 
 class TestPreload(unittest.TestCase):
     def test_runs_first_and_is_not_a_task(self):
         order = []
-        store = TaskStore(lambda data, on_step: order.append(data["prompt"]) or (b"png", 1), ":memory:")
+        store = TaskStore(lambda data, on_step: order.append(data["prompt"]) or (b"png", 1, None), ":memory:")
         started, gate = threading.Event(), threading.Event()
         preload = store.preload(lambda: (started.set(), gate.wait(5), order.append("preload")))
         task = store.submit(dump_request(GenerateRequest(prompt="a")))
@@ -463,6 +625,36 @@ class TestPersistence(unittest.TestCase):
         self.assertEqual((failed["status"], failed["error"]), ("FAILED", "ValidationError: model 'turbo' is not configured"))
         wait_store(self, new, "t2", "COMPLETED")  # its stored image round-tripped through base64
 
+    def test_unconfigured_upsampler_fails_on_recovery(self):
+        old = self.store(FakeRegistry(), max_queued=8)
+        old.shutdown()  # nothing ran: shut down before the worker could pick anything
+        db = TaskDB(self.path)
+        db.insert("t1", "klein", 42, json.dumps(dump_request(GenerateRequest(prompt="x", model="klein", steps=16, upsample=True))), 1.0)
+        db.insert("t2", "klein", 42, json.dumps(dump_request(GenerateRequest(prompt="y", model="klein", steps=16))), 2.0)
+        db.close()
+        new = self.store(FakeRegistry(can_upsample=False))
+        new.recover()
+        failed = wait_store(self, new, "t1", "FAILED", "COMPLETED")
+        self.assertEqual((failed["status"], failed["error"]), ("FAILED", "ValidationError: the prompt upsampler is not configured"))
+        wait_store(self, new, "t2", "COMPLETED")
+
+    def test_db_from_before_captions(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute("CREATE TABLE tasks (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, status TEXT NOT NULL,"
+                     " model TEXT NOT NULL, seed INTEGER NOT NULL, request TEXT, created_at REAL NOT NULL, started_at REAL,"
+                     " finished_at REAL, step INTEGER, steps INTEGER, error TEXT, image BLOB, steps_run INTEGER)")
+        conn.execute("INSERT INTO tasks (id, status, model, seed, created_at) VALUES ('old', 'COMPLETED', 'turbo', 1, 1.0)")
+        conn.commit()
+        conn.close()
+        for _ in range(2):  # the second open finds the column already there
+            db = TaskDB(self.path)
+            self.addCleanup(db.close)
+            self.assertIsNone(db.get("old")["caption"])
+        db.insert("new", "klein", 1, "{}", 2.0)
+        db.set_started("new", 3.0)
+        db.set_finished("new", 4.0, b"png", 16, None, "a caption")
+        self.assertEqual(db.get("new")["caption"], "a caption")
+
     def test_request_dropped_once_started(self):
         registry = FakeRegistry()
         self.addCleanup(registry.gate.set)
@@ -483,10 +675,10 @@ class TestPersistence(unittest.TestCase):
         store = self.store(FakeRegistry())
         write = store._db.set_finished
 
-        def full_disk(task_id, now, image, steps_run, error):
+        def full_disk(task_id, now, image, steps_run, error, caption=None):
             if image is not None:
                 raise sqlite3.OperationalError("database or disk is full")
-            write(task_id, now, image, steps_run, error)
+            write(task_id, now, image, steps_run, error, caption)
 
         store._db.set_finished = full_disk
         t = wait_store(self, store, self.submit(store, "x"), "FAILED", "COMPLETED")
@@ -539,6 +731,35 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(s.preload, ("turbo", "base"))
         self.assertEqual(set(s.model_paths), {"base", "turbo"})
 
+    def test_klein_only(self):
+        s = load_settings({"KLEIN_PATH": self.base, "IMAGEGEN_API_KEY": KEY})
+        self.assertEqual((s.model_paths, s.upsampler_path), ({"klein": self.base}, None))
+        s = load_settings({"KLEIN_PATH": self.base, "KLEIN_UPSAMPLER_PATH": self.tmp.name, "IMAGEGEN_API_KEY": KEY, "PRELOAD": "klein"})
+        self.assertEqual((s.upsampler_path, s.preload), (self.tmp.name, ("klein",)))
+
+    def test_no_model(self):
+        with self.assertRaisesRegex(ValueError, "no model configured"):
+            load_settings({"IMAGEGEN_API_KEY": KEY})
+        with self.assertRaisesRegex(ValueError, "no model configured"):  # the upsampler is not a model
+            load_settings({"KLEIN_UPSAMPLER_PATH": self.base, "IMAGEGEN_API_KEY": KEY})
+
+    def test_missing_upsampler_dir(self):
+        env = {"KLEIN_PATH": self.base, "KLEIN_UPSAMPLER_PATH": os.path.join(self.tmp.name, "missing"), "IMAGEGEN_API_KEY": KEY}
+        with self.assertRaisesRegex(ValueError, "KLEIN_UPSAMPLER_PATH"):
+            load_settings(env)
+
+    def test_device(self):
+        env = {"KLEIN_PATH": self.base, "IMAGEGEN_API_KEY": KEY}
+        self.assertEqual(load_settings({**env, "IMAGEGEN_DEVICE": " cuda "}).device, "cuda")
+        with self.assertRaisesRegex(ValueError, "IMAGEGEN_DEVICE"):
+            load_settings({**env, "IMAGEGEN_DEVICE": "tpu"})
+
+    def test_preload_one_family(self):
+        env = {"QWEN_IMAGE_21_PATH": self.base, "QWEN_IMAGE_21_TURBO_PATH": self.base, "KLEIN_PATH": self.base, "IMAGEGEN_API_KEY": KEY}
+        self.assertEqual(load_settings({**env, "PRELOAD": "base,turbo"}).preload, ("base", "turbo"))
+        with self.assertRaisesRegex(ValueError, "one family"):
+            load_settings({**env, "PRELOAD": "base,klein"})
+
     def test_errors(self):
         for env in [
             {},
@@ -548,7 +769,7 @@ class TestConfig(unittest.TestCase):
             {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": "short"},
             {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "PRELOAD": "turbo"},
             {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "PRELOAD": "huge"},
-            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "QWEN_IMAGE_21_DEVICE": "tpu"},
+            {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "IMAGEGEN_DEVICE": "tpu"},
             {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "PORT": "http"},
             {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "MAX_QUEUED": "0"},
             {"QWEN_IMAGE_21_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "TASK_TTL": "1h"},
@@ -607,12 +828,32 @@ class TestLoadPipeline(unittest.TestCase):
                         self.assertIsInstance(cfg.quant_type, quant_types[want[name]])
 
     def test_reference_side(self):
-        from imagegen.engine import qwen
+        from imagegen.engine.common import reference_side
 
-        self.assertEqual(qwen.reference_side(0, 7 * 1024**2), 1024)
-        self.assertEqual(qwen.reference_side(7, 7 * 1024**2), 1024)
-        self.assertEqual(qwen.reference_side(10, 7 * 1024**2), 832)
-        self.assertEqual(qwen.reference_side(10, 10 * 1024**2), 1024)
+        self.assertEqual(reference_side(0, 7 * 1024**2), 1024)
+        self.assertEqual(reference_side(7, 7 * 1024**2), 1024)
+        self.assertEqual(reference_side(10, 7 * 1024**2), 832)
+        self.assertEqual(reference_side(10, 10 * 1024**2), 1024)
+
+    def test_quant_config(self):
+        import diffusers
+        import transformers
+        from torchao.quantization import (
+            Float8DynamicActivationFloat8WeightConfig,
+            Float8WeightOnlyConfig,
+            Int8WeightOnlyConfig,
+        )
+
+        from imagegen.engine.common import quant_config
+
+        for library in (diffusers, transformers):
+            self.assertIsNone(quant_config(library, "bf16"))
+            for name, quant_type in (("int8", Int8WeightOnlyConfig), ("fp8", Float8WeightOnlyConfig),
+                                     ("fp8_dynamic", Float8DynamicActivationFloat8WeightConfig)):
+                with self.subTest(library=library.__name__, precision=name):
+                    config = quant_config(library, name)
+                    self.assertIs(type(config), library.TorchAoConfig)
+                    self.assertIsInstance(config.quant_type, quant_type)
 
     def test_shared_text_encoder_not_quantized(self):
         shared = {"text_encoder": object(), "vae": object(), "processor": object()}
@@ -625,12 +866,209 @@ class TestLoadPipeline(unittest.TestCase):
         self.assertEqual(set(kw["quantization_config"].quant_mapping), {"transformer"})
 
 
+class TestKleinEngine(unittest.TestCase):
+    def test_canvas_line(self):
+        from imagegen.engine import klein
+
+        self.assertEqual(klein.canvas_line(1360, 768), "TARGET CANVAS: 85:48\n")
+        self.assertEqual(klein.canvas_line(1024, 1024), "TARGET CANVAS: 1:1\n")
+
+    def test_one_reference_untouched(self):
+        from imagegen.engine import klein
+
+        img = Image.new("RGB", (3000, 2000))
+        self.assertIs(klein.fit_references([img], 1024**2)[0], img)  # the pipeline fits a single one itself
+
+    def test_references_under_budget_unchanged(self):
+        from imagegen.engine import klein
+
+        images = [Image.new("RGB", (2000, 2000)) for _ in range(3)]
+        self.assertIs(klein.fit_references(images, 10 * 1024**2), images)
+        images = images[:2] * 5  # 10 at 1024x1024 fit in 10 MP exactly
+        self.assertIs(klein.fit_references(images, 10 * 1024**2), images)
+
+    def test_references_shrink_to_budget(self):
+        from imagegen.engine import klein
+
+        out = klein.fit_references([Image.new("RGB", (2000, 1000))] * 10, 7 * 1024**2)
+        self.assertEqual(len(out), 10)
+        for img in out:
+            self.assertAlmostEqual(img.width * img.height, 832**2, delta=832**2 * 0.01)
+            self.assertAlmostEqual(img.width / img.height, 2, delta=0.01)
+        self.assertLessEqual(sum(img.width * img.height for img in out), 7 * 1024**2)
+
+    def test_small_references_never_upscale(self):
+        from imagegen.engine import klein
+
+        small = Image.new("RGB", (100, 100))
+        large = Image.new("RGB", (2000, 2000))
+        out = klein.fit_references([small, large] * 5, 7 * 1024**2)
+        self.assertIs(out[0], small)
+        self.assertEqual(out[1].size, (832, 832))
+
+    def test_render_uses_the_caption(self):
+        from imagegen.engine import klein
+
+        image = Image.new("RGB", (8, 8))
+        pipe = mock.MagicMock(return_value=[image])
+        req = GenerateRequest(prompt="cat", model="klein", ratio="16:9", steps=16, upsample=True)
+        with mock.patch.object(klein, "upsample", return_value="a long caption") as upsample:
+            result = klein.render(pipe, req, upsampler=("model", "processor"))
+        upsample.assert_called_once_with(("model", "processor"), "cat", None, 1360, 768)
+        self.assertEqual(result, (image, 16, "a long caption"))
+        kw = pipe.call_args.kwargs
+        self.assertEqual((kw["prompt"], kw["width"], kw["height"], kw["num_inference_steps"]), ("a long caption", 1360, 768, 16))
+        pipe.transformer.register_forward_hook.return_value.remove.assert_called_once()
+
+
+class TestModelRegistry(unittest.TestCase):
+    """The real registry with stub engines patched in: no weights."""
+
+    PATHS = {"base": "/base", "turbo": "/turbo", "klein": "/klein"}
+
+    def setUp(self):
+        from imagegen.engine import registry
+
+        self.loads = []  # (path, loaded)
+        self.broken = set()  # paths whose load raises
+        self.renders = []  # (pipe, model, max_reference_pixels, extra kwargs)
+
+        def load(path, device, loaded, transformer, text_encoder):
+            self.loads.append((path, loaded))
+            if path in self.broken:
+                raise RuntimeError("no weights")
+            return f"pipe {path}"
+
+        def render(pipe, req, on_step, max_reference_pixels, **extra):
+            self.renders.append((pipe, req.model, max_reference_pixels, extra))
+            return "image", req.steps, "caption" if req.upsample else None
+
+        stub = SimpleNamespace(load=load, render=render)
+        for patcher in (mock.patch.dict(registry.ENGINES, {"qwen": stub, "klein": stub}),
+                        mock.patch.object(registry, "print", create=True)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(registry.klein, "load_upsampler", return_value=("model", "processor"))
+        self.load_upsampler = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.registry = registry.ModelRegistry(self.PATHS, "cpu", max_reference_pixels=123, upsampler_path="/upsampler")
+
+    def loaded(self):
+        return {name for name, s in self.registry.status().items() if s["loaded"]}
+
+    def upsample_klein(self):
+        return self.registry.render(GenerateRequest(prompt="x", model="klein", steps=16, upsample=True))
+
+    def test_configured_and_status(self):
+        from imagegen.engine.registry import ModelRegistry
+
+        registry = ModelRegistry({"klein": "/klein", "base": "/base"}, "cpu")
+        self.assertEqual(registry.configured, ("base", "klein"))  # MODELS order, whatever the dict's
+        self.assertFalse(registry.can_upsample)
+        self.assertEqual(registry.upsampler_status(), {"configured": False, "loaded": False})
+        no_klein = ModelRegistry({"turbo": "/turbo"}, "cpu", upsampler_path="/upsampler")
+        self.assertFalse(no_klein.can_upsample)  # nothing could use it
+        self.assertEqual(registry.status(), {
+            "base": {"configured": True, "loaded": False},
+            "turbo": {"configured": False, "loaded": False},
+            "klein": {"configured": True, "loaded": False},
+        })
+        self.assertEqual(self.registry.upsampler_status(), {"configured": True, "loaded": False})
+
+    def test_qwen_family_stays_loaded_together(self):
+        self.registry.get("base")
+        self.registry.get("turbo")
+        self.assertEqual(self.loads, [("/base", []), ("/turbo", ["pipe /base"])])
+        self.assertEqual(self.loaded(), {"base", "turbo"})
+        self.assertEqual(self.registry.get("base"), "pipe /base")
+        self.assertEqual(len(self.loads), 2)  # already resident
+
+    def test_klein_evicts_qwen(self):
+        self.registry.get("base")
+        self.registry.get("turbo")
+        self.registry.get("klein")
+        self.assertEqual(self.loads[-1], ("/klein", []))
+        self.assertEqual(self.loaded(), {"klein"})
+        self.assertEqual({m["id"]: m["loaded"] for m in model_views(self.registry)}, {"base": False, "turbo": False, "klein": True})
+
+    def test_qwen_evicts_klein_and_upsampler(self):
+        self.upsample_klein()
+        self.upsample_klein()
+        self.assertEqual(self.registry.upsampler_status(), {"configured": True, "loaded": True})
+        self.assertEqual(self.load_upsampler.call_count, 1)
+        self.load_upsampler.assert_called_once_with("/upsampler", "cpu")
+        self.registry.get("turbo")
+        self.assertEqual(self.loads[-1], ("/turbo", []))
+        self.assertEqual(self.loaded(), {"turbo"})
+        self.assertEqual(self.registry.upsampler_status(), {"configured": True, "loaded": False})
+        self.upsample_klein()  # and they come back on the next ask
+        self.assertEqual(self.load_upsampler.call_count, 2)
+        self.assertEqual(self.loaded(), {"klein"})
+
+    def test_failed_load_leaves_registry_usable(self):
+        self.registry.get("base")
+        self.broken = {"/turbo"}
+        with self.assertRaises(RuntimeError):
+            self.registry.get("turbo")
+        self.assertEqual(self.loaded(), {"base"})  # same family: nothing was evicted
+        self.broken = {"/klein"}
+        with self.assertRaises(RuntimeError):
+            self.registry.get("klein")
+        self.assertEqual(self.loaded(), set())  # freed before the load, so it had the memory
+        self.broken = set()
+        self.assertEqual(self.registry.get("klein"), "pipe /klein")
+        self.assertEqual(self.loaded(), {"klein"})
+
+    def test_render_passes_upsampler_only_when_asked(self):
+        self.assertEqual(self.registry.render(GenerateRequest(prompt="x", model="base", steps=7)), ("image", 7, None))
+        self.registry.render(GenerateRequest(prompt="x", model="klein", steps=16))
+        self.assertEqual(self.upsample_klein(), ("image", 16, "caption"))
+        self.assertEqual(self.renders, [
+            ("pipe /base", "base", 123, {}),
+            ("pipe /klein", "klein", 123, {}),
+            ("pipe /klein", "klein", 123, {"upsampler": ("model", "processor")}),
+        ])
+
+
 class TestSchemas(unittest.TestCase):
     def test_defaults(self):
         req = parse_request({"prompt": "hi"}, MODELS)
         self.assertEqual(req, GenerateRequest(prompt="hi"))
         self.assertEqual((req.model, req.steps, req.seed, req.transparent, req.images), ("turbo", 40, 42, False, ()))
         self.assertEqual(parse_request({"prompt": "hi"}, ("base",)).model, "base")
+        self.assertEqual(parse_request({"prompt": "hi"}, ("klein",)).model, "klein")
+        self.assertEqual(parse_request({"prompt": "hi"}, ("base", "klein")).model, "base")
+
+    def test_sides_per_model(self):
+        for side in (64, 80, 1040, 4096):
+            with self.subTest(side=side):
+                req = parse_request({"prompt": "hi", "model": "klein", "width": side, "height": side}, MODELS)
+                self.assertEqual((req.width, req.height), (side, side))
+        for side in (1040, 4096):
+            with self.subTest(side=side), self.assertRaises(ValidationError):
+                parse_request({"prompt": "hi", "model": "turbo", "width": side}, MODELS)
+
+    def test_steps_per_model(self):
+        klein = {"prompt": "hi", "model": "klein"}
+        self.assertEqual(parse_request(klein, MODELS).steps, 16)
+        self.assertEqual(parse_request({**klein, "steps": 40}, MODELS).steps, 16)
+        self.assertEqual(parse_request({**klein, "steps": 8}, MODELS).steps, 8)
+        self.assertEqual(parse_request({"prompt": "hi", "model": "turbo"}, MODELS).steps, 40)
+        self.assertEqual(parse_request({"prompt": "hi", "model": "base", "steps": 100}, MODELS).steps, 100)
+
+    def test_input_pixels_per_model(self):
+        over_qwen = b64png((4000, 4000))  # 16 MP
+        self.assertEqual(len(parse_request({"prompt": "hi", "model": "klein", "images": [over_qwen]}, MODELS).images), 1)
+        with self.assertRaises(ValidationError):
+            parse_request({"prompt": "hi", "model": "turbo", "images": [over_qwen]}, MODELS)
+
+    def test_options(self):
+        klein = parse_request({"prompt": "hi", "model": "klein", "upsample": True}, MODELS)
+        self.assertEqual((klein.upsample, klein.transparent), (True, False))
+        self.assertEqual(parse_request({"prompt": "hi", "transparent": True}, MODELS).transparent, True)
+        self.assertEqual(parse_request({"prompt": "hi", "upsample": False, "transparent": False}, MODELS).upsample, False)
+        with self.assertRaises(ValidationError):
+            parse_request({"prompt": "hi", "model": "klein", "upsample": True}, MODELS, can_upsample=False)
 
     def test_full(self):
         req = parse_request(
@@ -644,6 +1082,8 @@ class TestSchemas(unittest.TestCase):
 
     def test_dump_round_trips(self):
         req = parse_request({"prompt": "hi", "model": "turbo", "ratio": "4:3", "images": [b64png()]}, MODELS)
+        self.assertEqual(parse_request(json.loads(json.dumps(dump_request(req))), MODELS), req)
+        req = parse_request({"prompt": "hi", "model": "klein", "width": 4096, "upsample": True}, MODELS)
         self.assertEqual(parse_request(json.loads(json.dumps(dump_request(req))), MODELS), req)
 
     def test_seed_range(self):

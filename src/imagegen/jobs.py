@@ -23,7 +23,7 @@ class QueueFull(Exception):
 
 class TaskStore:
     """Tasks by id, kept in the SQLite file `db_path`. `render(data, on_step)` runs on the worker thread with the
-    stored request dict and returns (png_bytes, steps).
+    stored request dict and returns (png_bytes, steps, caption or None).
     """
 
     def __init__(self, render, db_path: str, max_queued: int = 64, ttl: float = 3600, clock=time.time) -> None:
@@ -121,12 +121,12 @@ class TaskStore:
             self._db.set_step(task_id, i, n)
 
         try:
-            (png, steps), error = self._busy_while(self._render, json.loads(request), on_step), None
+            (png, steps, caption), error = self._busy_while(self._render, json.loads(request), on_step), None
         except Exception as e:
             traceback.print_exc(file=sys.stderr)
-            png, steps, error = None, None, f"{type(e).__name__}: {e}"
+            png, steps, caption, error = None, None, None, f"{type(e).__name__}: {e}"
         try:
-            self._db.set_finished(task_id, self._clock(), png, steps, error)
+            self._db.set_finished(task_id, self._clock(), png, steps, error, caption)
         except Exception as e:  # e.g. disk full on the PNG blob: a small FAILED write may still land
             traceback.print_exc(file=sys.stderr)
             self._db.set_finished(task_id, self._clock(), None, None, f"{type(e).__name__}: {e}")
@@ -145,6 +145,7 @@ class TaskStore:
             "step": row["step"],
             "steps": row["steps"],
             "error": row["error"],
+            "caption": row["caption"],
             "created_at": row["created_at"],
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],

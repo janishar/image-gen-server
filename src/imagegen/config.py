@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .schemas import MODELS
+
 DEVICES = ("auto", "mps", "cuda", "cpu")
 PRECISIONS = ("bf16", "int8", "fp8", "fp8_dynamic")
 TEXT_ENCODER_PRECISIONS = ("bf16", "int8", "fp8")  # fp8_dynamic's quantized activations would reach rendered text first
@@ -15,6 +17,8 @@ MIN_API_KEY = 16
 class Settings:
     base_path: str | None
     turbo_path: str | None
+    klein_path: str | None
+    upsampler_path: str | None
     device: str
     host: str
     port: int
@@ -31,15 +35,13 @@ class Settings:
     @property
     def model_paths(self) -> dict[str, str]:
         """The configured models, by name."""
-        paths = {"base": self.base_path, "turbo": self.turbo_path}
+        paths = {"base": self.base_path, "turbo": self.turbo_path, "klein": self.klein_path}
         return {name: path for name, path in paths.items() if path}
 
 
-def _model_dir(env, key: str, required: bool) -> str | None:
+def _model_dir(env, key: str) -> str | None:
     value = env.get(key, "").strip()
     if not value:
-        if required:
-            raise ValueError(f"{key} is required: the Qwen-Image-2.1 model directory")
         return None
     path = os.path.expanduser(value)
     if not os.path.isdir(path):
@@ -85,12 +87,14 @@ def _api_key(env) -> str:
 
 def load_settings(env=os.environ) -> Settings:
     """Read and check the settings, raising ValueError on anything wrong."""
-    base = _model_dir(env, "QWEN_IMAGE_21_PATH", required=True)
-    turbo = _model_dir(env, "QWEN_IMAGE_21_TURBO_PATH", required=False)
+    base = _model_dir(env, "QWEN_IMAGE_21_PATH")
+    turbo = _model_dir(env, "QWEN_IMAGE_21_TURBO_PATH")
+    klein = _model_dir(env, "KLEIN_PATH")
+    upsampler = _model_dir(env, "KLEIN_UPSAMPLER_PATH")
 
-    device = env.get("QWEN_IMAGE_21_DEVICE", "").strip() or "auto"
+    device = env.get("IMAGEGEN_DEVICE", "").strip() or "auto"
     if device not in DEVICES:
-        raise ValueError(f"QWEN_IMAGE_21_DEVICE must be one of {', '.join(DEVICES)}, got {device!r}")
+        raise ValueError(f"IMAGEGEN_DEVICE must be one of {', '.join(DEVICES)}, got {device!r}")
 
     port_text = env.get("PORT", "").strip() or "8740"
     try:
@@ -103,6 +107,8 @@ def load_settings(env=os.environ) -> Settings:
     settings = Settings(
         base_path=base,
         turbo_path=turbo,
+        klein_path=klein,
+        upsampler_path=upsampler,
         device=device,
         host=env.get("HOST", "").strip() or "127.0.0.1",
         port=port,
@@ -116,7 +122,11 @@ def load_settings(env=os.environ) -> Settings:
         max_reference_pixels=_positive(env, "MAX_REFERENCE_PIXELS", 10 * 1024**2),
         api_key=_api_key(env),
     )
+    if not settings.model_paths:
+        raise ValueError("no model configured: set QWEN_IMAGE_21_PATH, QWEN_IMAGE_21_TURBO_PATH or KLEIN_PATH")
     for name in settings.preload:
         if name not in settings.model_paths:
             raise ValueError(f"PRELOAD: model {name!r} is not configured (configured: {', '.join(settings.model_paths)})")
+    if len({MODELS[name].family for name in settings.preload}) > 1:
+        raise ValueError("PRELOAD: one family stays loaded at a time, so name models of one family")
     return settings

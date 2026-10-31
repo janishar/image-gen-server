@@ -1,4 +1,4 @@
-"""The /generate request: its fields, defaults and validation."""
+"""The task request: its fields, defaults and what each model accepts."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from dataclasses import dataclass, fields, replace
 
 from PIL import Image
 
-ASPECT_RATIOS = {
+QWEN_RATIOS = {
     "1:1": (2048, 2048),
     "4:3": (2400, 1792),
     "3:4": (1792, 2400),
@@ -21,9 +21,44 @@ ASPECT_RATIOS = {
     "9:16": (1536, 2752),
 }
 
-MODELS = ("base", "turbo")
+KLEIN_RATIOS = {
+    "1:1": (1024, 1024),
+    "4:3": (1152, 864),
+    "3:4": (864, 1152),
+    "3:2": (1248, 832),
+    "2:3": (832, 1248),
+    "16:9": (1360, 768),
+    "9:16": (768, 1360),
+}
+
 MAX_IMAGES = 10
-MAX_INPUT_PIXELS = 2 * 2752 * 2752  # twice the largest output; a 12 MP phone photo fits
+OPTIONS = ("transparent", "upsample")
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """What one model accepts. Models of a family share memory, and one family stays loaded at a time."""
+
+    family: str
+    ratios: dict[str, tuple[int, int]]
+    min_side: int
+    max_side: int
+    side_multiple: int
+    steps: int  # when a request sends none
+    max_steps: int  # a longer request is cut to this, so a client can send one number to every model
+    options: tuple[str, ...] = ()  # the OPTIONS this model takes
+
+    @property
+    def max_input_pixels(self) -> int:
+        return 2 * self.max_side**2  # twice the largest output; a 12 MP phone photo fits
+
+
+_QWEN = ModelSpec("qwen", QWEN_RATIOS, 256, 2752, 32, steps=40, max_steps=100, options=("transparent",))
+MODELS = {
+    "base": _QWEN,
+    "turbo": _QWEN,  # takes `steps` but always runs its own 8-step schedule
+    "klein": ModelSpec("klein", KLEIN_RATIOS, 64, 4096, 16, steps=16, max_steps=16, options=("upsample",)),
+}
 
 
 class ValidationError(ValueError):
@@ -40,6 +75,7 @@ class GenerateRequest:
     steps: int = 40
     seed: int = 42
     transparent: bool = False
+    upsample: bool = False
     images: tuple = ()  # raw image bytes once parsed (small while queued); PIL images after load_images
 
 
@@ -56,14 +92,14 @@ def _int(data: dict, key: str, lo: int, hi: int, multiple: int = 1) -> int | Non
     return value
 
 
-def _decode_image(i: int, text: object) -> bytes:
+def _decode_image(i: int, text: object, max_pixels: int) -> bytes:
     if not isinstance(text, str):
         raise ValidationError(f"images[{i}] must be a base64 string")
     try:
         raw = base64.b64decode(text, validate=True)
         img = Image.open(io.BytesIO(raw))
-        if img.width * img.height > MAX_INPUT_PIXELS:
-            raise ValidationError(f"images[{i}] is {img.width}x{img.height}, over {MAX_INPUT_PIXELS} pixels")
+        if img.width * img.height > max_pixels:
+            raise ValidationError(f"images[{i}] is {img.width}x{img.height}, over {max_pixels} pixels")
         img.load()  # decoded only to validate; the worker decodes again in load_images
     except ValidationError:
         raise
@@ -90,7 +126,7 @@ def dump_request(req: GenerateRequest) -> dict:
     return data
 
 
-def parse_request(data: object, available_models: Collection[str]) -> GenerateRequest:
+def parse_request(data: object, available_models: Collection[str], can_upsample: bool = True) -> GenerateRequest:
     """Check a decoded JSON body and turn it into a GenerateRequest, raising ValidationError on anything wrong."""
     if not isinstance(data, dict):
         raise ValidationError("request body must be a JSON object")
@@ -102,19 +138,25 @@ def parse_request(data: object, available_models: Collection[str]) -> GenerateRe
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValidationError("prompt must be a non-empty string")
 
-    model = data.get("model", "turbo" if "turbo" in available_models else "base")  # turbo by default, base if it is all there is
-    if model not in MODELS:
+    model = data.get("model", "turbo" if "turbo" in available_models else next(iter(available_models)))
+    if not isinstance(model, str) or model not in MODELS:
         raise ValidationError(f"model must be one of {', '.join(MODELS)}")
     if model not in available_models:
         raise ValidationError(f"model {model!r} is not configured")
+    spec = MODELS[model]
 
     ratio = data.get("ratio")
-    if ratio is not None and (not isinstance(ratio, str) or ratio not in ASPECT_RATIOS):
-        raise ValidationError(f"ratio must be one of {', '.join(ASPECT_RATIOS)}")
+    if ratio is not None and (not isinstance(ratio, str) or ratio not in spec.ratios):
+        raise ValidationError(f"ratio must be one of {', '.join(spec.ratios)}")
 
-    transparent = data.get("transparent", False)
-    if not isinstance(transparent, bool):
-        raise ValidationError("transparent must be a boolean")
+    for option in OPTIONS:
+        value = data.get(option, False)
+        if not isinstance(value, bool):
+            raise ValidationError(f"{option} must be a boolean")
+        if value and option not in spec.options:
+            raise ValidationError(f"model {model!r} has no {option} option")
+    if data.get("upsample") and not can_upsample:
+        raise ValidationError("the prompt upsampler is not configured")
 
     images = data.get("images", [])
     if not isinstance(images, list):
@@ -128,10 +170,11 @@ def parse_request(data: object, available_models: Collection[str]) -> GenerateRe
         prompt=prompt,
         model=model,
         ratio=ratio,
-        width=_int(data, "width", 256, 2752, 32),
-        height=_int(data, "height", 256, 2752, 32),
-        steps=40 if steps is None else steps,
+        width=_int(data, "width", spec.min_side, spec.max_side, spec.side_multiple),
+        height=_int(data, "height", spec.min_side, spec.max_side, spec.side_multiple),
+        steps=spec.steps if steps is None else min(steps, spec.max_steps),
         seed=42 if seed is None else seed,
-        transparent=transparent,
-        images=tuple(_decode_image(i, text) for i, text in enumerate(images)),
+        transparent=data.get("transparent", False),
+        upsample=data.get("upsample", False),
+        images=tuple(_decode_image(i, text, spec.max_input_pixels) for i, text in enumerate(images)),
     )

@@ -1,28 +1,34 @@
-"""Lazily loaded, resident pipelines keyed by model name."""
+"""Lazily loaded pipelines keyed by model name, one model family in memory at a time."""
 
 from __future__ import annotations
+
+import gc
 
 import torch
 
 from ..schemas import MODELS, GenerateRequest
-from . import qwen
-from .device import patch_mps_empty_cache
+from . import klein, qwen
+from .device import empty_cache, patch_mps_empty_cache
+
+ENGINES = {"qwen": qwen, "klein": klein}  # by ModelSpec.family: each has load() and render()
 
 
 class ModelRegistry:
-    """Loads each configured model on first use and keeps it until the process exits.
+    """Loads each configured model on first use and keeps it until a model of another family is asked for.
 
-    ponytail: both models resident ≈44 GB of a 64 GB Mac (text_encoder/vae shared); eviction left out,
-    add an LRU drop + device.empty_cache if a third model or a smaller machine shows up.
+    ponytail: every family swap costs a full load, and tasks alternating between families pay it each time; run a
+    family's queued tasks together if that hurts. Base and Turbo stay resident together, ≈44 GB in bf16 of a 64 GB Mac.
     """
 
     def __init__(self, model_paths: dict[str, str], device: str, transformer: str = "bf16", text_encoder: str = "bf16",
-                 memory_fraction: float = 0, max_reference_pixels: int = 10 * 1024**2):
+                 memory_fraction: float = 0, max_reference_pixels: int = 10 * 1024**2, upsampler_path: str | None = None):
         self.model_paths = dict(model_paths)
         self.device = device
         self.precision = {"transformer": transformer, "text_encoder": text_encoder}
         self.max_reference_pixels = max_reference_pixels
+        self.upsampler_path = upsampler_path
         self._pipes: dict[str, object] = {}
+        self._upsampler = None
         if device == "mps":
             patch_mps_empty_cache()
         if device == "cuda" and memory_fraction:  # an overrun fails this render, not vLLM beside it
@@ -32,26 +38,55 @@ class ModelRegistry:
     def configured(self) -> tuple[str, ...]:
         return tuple(name for name in MODELS if name in self.model_paths)
 
+    @property
+    def can_upsample(self) -> bool:
+        return self.upsampler_path is not None and "klein" in self.model_paths
+
     def status(self) -> dict[str, dict]:
         return {
             name: {"configured": name in self.model_paths, "loaded": name in self._pipes}
             for name in MODELS
         }
 
+    def upsampler_status(self) -> dict:
+        return {"configured": self.can_upsample, "loaded": self._upsampler is not None}
+
+    def _evict(self, family: str) -> None:
+        """Free every model outside `family`, with Klein's upsampler, so `family` has the memory to load."""
+        others = [name for name in self._pipes if MODELS[name].family != family]
+        if not others:
+            return
+        print(f"Unloading {', '.join(others)}", flush=True)
+        for name in others:
+            del self._pipes[name]
+        self._upsampler = None
+        gc.collect()  # the patched VAE refers to itself, so only the collector frees it
+        empty_cache(self.device)
+
     def get(self, name: str):
         """The pipeline for `name`, loading it now if needed. Worker thread only."""
         if name not in self._pipes:
-            other = next(iter(self._pipes.values()), None)
-            shared = qwen.shared_components(other) if other is not None else None
+            family = MODELS[name].family
+            self._evict(family)
             print(f"Loading {name} from {self.model_paths[name]}", flush=True)
-            self._pipes[name] = qwen.load_pipeline(self.model_paths[name], self.device, shared, **self.precision)
-            if other is None and self.device == "cuda":  # the VAE is shared, so once
-                qwen.trim_vae(self._pipes[name].vae)
+            loaded = list(self._pipes.values())
+            self._pipes[name] = ENGINES[family].load(self.model_paths[name], self.device, loaded, **self.precision)
         return self._pipes[name]
 
+    def upsampler(self) -> tuple:
+        """The upsampler, loading it now if needed. Worker thread only."""
+        if self._upsampler is None:
+            print(f"Loading the upsampler from {self.upsampler_path}", flush=True)
+            self._upsampler = klein.load_upsampler(self.upsampler_path, self.device)
+        return self._upsampler
+
     def render(self, req: GenerateRequest, on_step=None):
+        """(image, steps run, caption or None) for `req`."""
         try:
-            return qwen.render(self.get(req.model), req, on_step, self.max_reference_pixels)
+            pipe = self.get(req.model)
+            extra = {"upsampler": self.upsampler()} if req.upsample else {}
+            engine = ENGINES[MODELS[req.model].family]
+            return engine.render(pipe, req, on_step, self.max_reference_pixels, **extra)
         finally:
             if self.device == "cuda":  # a vLLM restart needs this memory free
                 torch.cuda.empty_cache()

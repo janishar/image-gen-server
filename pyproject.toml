@@ -1,7 +1,7 @@
 [project]
 name = "image-gen-server"
 version = "0.1.0"
-description = "Queued on-demand Qwen-Image-2.1 (base and Turbo) image generation server"
+description = "Queued on-demand image generation server: Qwen-Image-2.1 (base and Turbo) and FLUX 3 Image Klein"
 readme = "README.md"
 authors = [
     { name = "Janishar Ali", email = "janishar.ali@gmail.com" }

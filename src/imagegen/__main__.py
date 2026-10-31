@@ -29,7 +29,7 @@ def main() -> None:
         sys.exit(2)
     registry = ModelRegistry(
         settings.model_paths, device, settings.transformer_precision, settings.text_encoder_precision,
-        settings.gpu_memory_fraction, settings.max_reference_pixels,
+        settings.gpu_memory_fraction, settings.max_reference_pixels, settings.upsampler_path,
     )
     tasks = TaskStore(png_render(registry), settings.db_path, settings.max_queued, settings.task_ttl)
     lock = open(settings.db_path + ".lock", "w")  # held until exit: a second server on this db would recover() our rows
@@ -54,6 +54,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, on_sigterm)
     print(
         f"Serving on http://{settings.host}:{server.server_address[1]} ({device}, {', '.join(registry.configured)}, "
+        f"upsampler {'on' if settings.upsampler_path else 'off'}, "
         f"transformer {settings.transformer_precision}, text_encoder {settings.text_encoder_precision})",
         flush=True,
     )
