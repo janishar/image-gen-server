@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 
 from ..schemas import MODELS, GenerateRequest
-from .common import quant_config, reference_side
+from .common import fit_references, quant_config
 
 
 def load_pipeline(path: str, device: str, transformer: str = "bf16", text_encoder: str = "bf16"):
@@ -73,21 +73,6 @@ def upsample(upsampler: tuple, prompt: str, images: list[Image.Image] | None, wi
             images=prepare_references(images) if images else None,
             max_new_tokens=MAX_NEW_TOKENS,
         )
-
-
-def fit_references(images: list[Image.Image], max_pixels: int) -> list[Image.Image]:
-    """`images` shrunk evenly to stay under `max_pixels` together. The pipeline fits several references under 1 MP each
-    and a single one under 4 MP, so only a budget tighter than that changes anything here."""
-    side = reference_side(len(images), max_pixels)
-    if len(images) < 2 or side >= 1024:
-        return images
-
-    def shrink(img: Image.Image) -> Image.Image:
-        scale = side / (img.width * img.height) ** 0.5
-        size = (round(img.width * scale), round(img.height * scale))
-        return img if scale >= 1 else img.resize(size, Image.Resampling.LANCZOS)
-
-    return [shrink(img) for img in images]
 
 
 def render(pipe, req: GenerateRequest, on_step=None, max_reference_pixels: int = 10 * 1024**2,

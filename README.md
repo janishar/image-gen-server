@@ -1,8 +1,8 @@
 # image-gen-server
 
 A small on-demand HTTP server for several image models behind one API: Qwen-Image-2.1 (`qwen-base`),
-Qwen-Image-2.1-Turbo (`qwen-turbo`) and FLUX 3 Image Klein (`flux-klein`, the distilled 16-step checkpoint, not Klein
-Base).
+Qwen-Image-2.1-Turbo (`qwen-turbo`), FLUX 3 Image Klein (`flux-klein`, the distilled 16-step checkpoint, not Klein
+Base) and Bria Fibo 2.0 Edit Turbo (`fibo-edit-turbo`, edit only).
 Jobs run one at a time in a FIFO queue on a single worker thread. A model loads the first time it is used and stays in
 memory until a model of another family is asked for (see [Memory](#memory)). Clients submit a task, poll it and
 download the PNG.
@@ -14,14 +14,17 @@ download the PNG.
 | `qwen-base` | Qwen | 256..2752, multiples of 32 | about 4 MP | default 40, max 100 | `transparent` |
 | `qwen-turbo` | Qwen | 256..2752, multiples of 32 | about 4 MP | taken, but always runs its own 8-step schedule | `transparent` |
 | `flux-klein` | Flux | 64..4096, multiples of 16 | about 1 MP | default 16, max 16 (a longer request is cut to 16) | `upsample`, with `FLUX_KLEIN_UPSAMPLER_PATH` |
+| `fibo-edit-turbo` | Fibo | 64..2752, multiples of 16 | about 1 MP | default 4, max 4 (a longer request is cut to 4) | none |
 
 Every model takes the ratios `1:1`, `4:3`, `3:4`, `3:2`, `2:3`, `16:9`, `9:16`, but the same ratio means a different
-size per family: `16:9` is 2752×1536 on Qwen and 1360×768 on Klein. `GET /v1/models` lists all of this for the models
-a server has configured.
+size per family: `16:9` is 2752×1536 on Qwen and 1360×768 on Klein and Fibo. `GET /v1/models` lists all of this for the
+models a server has configured.
 
-Every model takes up to 10 reference `images`. With references and no size in the request, the output follows a
-different reference per family: Qwen keeps the aspect of the **last** image at about 1 MP, Klein keeps the size of the
-**first** image, fitted under 4 MP for one reference or 1 MP for several.
+Qwen and Klein take up to 10 reference `images`. `fibo-edit-turbo` takes up to 4 and at least 1: it only edits, so a
+request with no image is a 400. With references and no size in the request, the output follows a different reference
+per family: Qwen keeps the aspect of the **last** image at about 1 MP, Klein keeps the size of the **first** image,
+fitted under 4 MP for one reference or 1 MP for several, and Fibo keeps the aspect of the **first** image at about 1 MP,
+the size it was trained at.
 
 A request with no `model` gets `qwen-turbo` when configured, otherwise the first configured model.
 
@@ -43,8 +46,15 @@ hf download black-forest-labs/flux-3-image-klein --local-dir ~/models/flux-3-ima
 hf download black-forest-labs/flux-3-image-klein-pup --local-dir ~/models/flux-3-image-klein-pup   # optional
 ```
 
-At least one of `QWEN_IMAGE_21_PATH`, `QWEN_IMAGE_21_TURBO_PATH` and `FLUX_KLEIN_PATH` is required. A model with no path
-is off, and a path that is set must exist.
+Fibo's repo is gated too: fill in Bria's access form on [the repo](https://huggingface.co/briaai/Fibo-2.0-edit-turbo)
+first. It is non-commercial, see [License](#license).
+
+```sh
+hf download briaai/Fibo-2.0-edit-turbo --local-dir ~/models/Fibo-2.0-edit-turbo
+```
+
+At least one of `QWEN_IMAGE_21_PATH`, `QWEN_IMAGE_21_TURBO_PATH`, `FLUX_KLEIN_PATH` and `FIBO_EDIT_TURBO_PATH` is
+required. A model with no path is off, and a path that is set must exist.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -52,18 +62,19 @@ is off, and a path that is set must exist.
 | `QWEN_IMAGE_21_PATH` | unset | Qwen-Image-2.1 model directory (`qwen-base` off if unset) |
 | `QWEN_IMAGE_21_TURBO_PATH` | unset | Qwen-Image-2.1-Turbo model directory (`qwen-turbo` off if unset) |
 | `FLUX_KLEIN_PATH` | unset | FLUX 3 Image Klein model directory (`flux-klein` off if unset) |
+| `FIBO_EDIT_TURBO_PATH` | unset | Bria Fibo 2.0 Edit Turbo model directory (`fibo-edit-turbo` off if unset) |
 | `FLUX_KLEIN_UPSAMPLER_PATH` | unset | Prompt upsampler directory, for requests that send `"upsample": true`. Unset, those are a 400 |
 | `IMAGEGEN_DEVICE` | `auto` | `auto`, `mps`, `cuda` or `cpu` (auto: MPS, else CUDA, else CPU). Replaces `QWEN_IMAGE_21_DEVICE` and `KLEIN_DEVICE`, which are no longer read |
 | `TRANSFORMER_PRECISION` | `bf16` | The default for every family. `bf16`, `int8`, `fp8` or `fp8_dynamic`: transformer weights, quantized while loading (no converted copy on disk). `fp8_dynamic` also quantizes activations and uses the FP8 matmul; it needs a CUDA GPU with FP8 support |
 | `TEXT_ENCODER_PRECISION` | `bf16` | The default for every family. `bf16`, `int8` or `fp8`: text encoder weights, same as above (the VAE and the upsampler always stay `bf16`) |
 | `GPU_MEMORY_FRACTION` | `0` (no cap) | One value for the whole server, CUDA only: the share of the card this server may hold, so an overrun fails one render instead of a process beside it. CUDA also tiles the Qwen VAE decode |
-| `MAX_REFERENCE_PIXELS` | `10485760` | The default for every family: total reference pixels per request; past it every reference shrinks evenly. Each reference is about 1 MP inside a Qwen model. For Klein it only matters with several references, and only when the budget is tighter than 1 MP each. With no size in the request, shrunk references shrink the output too |
-| `QWEN_TRANSFORMER_PRECISION`, `FLUX_TRANSFORMER_PRECISION` | `TRANSFORMER_PRECISION` | That family's transformer. Same values as the shared key |
-| `QWEN_TEXT_ENCODER_PRECISION`, `FLUX_TEXT_ENCODER_PRECISION` | `TEXT_ENCODER_PRECISION` | That family's text encoder. Same values as the shared key, so no `fp8_dynamic` here either |
-| `QWEN_MAX_REFERENCE_PIXELS`, `FLUX_MAX_REFERENCE_PIXELS` | `MAX_REFERENCE_PIXELS` | That family's reference budget |
+| `MAX_REFERENCE_PIXELS` | `10485760` | The default for every family: total reference pixels per request; past it every reference shrinks evenly. Each reference is about 1 MP inside a Qwen model. For Klein it only matters with several references, and only when the budget is tighter than 1 MP each. With no size in the request, shrunk references shrink the output too. Fibo scales its references back up, so a tight budget there loses detail and saves no memory |
+| `QWEN_TRANSFORMER_PRECISION`, `FLUX_TRANSFORMER_PRECISION`, `FIBO_TRANSFORMER_PRECISION` | `TRANSFORMER_PRECISION` | That family's transformer. Same values as the shared key |
+| `QWEN_TEXT_ENCODER_PRECISION`, `FLUX_TEXT_ENCODER_PRECISION`, `FIBO_TEXT_ENCODER_PRECISION` | `TEXT_ENCODER_PRECISION` | That family's text encoder. Same values as the shared key, so no `fp8_dynamic` here either |
+| `QWEN_MAX_REFERENCE_PIXELS`, `FLUX_MAX_REFERENCE_PIXELS`, `FIBO_MAX_REFERENCE_PIXELS` | `MAX_REFERENCE_PIXELS` | That family's reference budget |
 | `HOST` | `127.0.0.1` | Bind address |
 | `PORT` | `8740` | Port |
-| `PRELOAD` | empty | Comma list of models to load at startup, all of one family: `qwen-turbo`, `qwen-base,qwen-turbo` or `flux-klein`. Mixing families refuses to start. The upsampler is not preloaded |
+| `PRELOAD` | empty | Comma list of models to load at startup, all of one family: `qwen-turbo`, `qwen-base,qwen-turbo`, `flux-klein` or `fibo-edit-turbo`. Mixing families refuses to start. The upsampler is not preloaded |
 | `MAX_QUEUED` | `64` | Waiting (`CREATED`) tasks allowed before a submit answers 429 |
 | `TASK_TTL` | `3600` | Seconds a finished task and its PNG are kept before polls return 404 |
 | `DB_PATH` | `data/imagegen.sqlite3` | SQLite file holding tasks and PNGs (relative to the working directory; created if missing) |
@@ -83,8 +94,8 @@ kept in the SQLite file `DB_PATH`, so they survive a restart (see below). [doc/A
 - `POST /v1/tasks` takes JSON and answers `202 {"data": {"task_id", "status": "CREATED", "position"}}`
   (`position` 0 = runs next). Fields: `prompt` (required), `model`, `ratio`, `width`/`height`, `steps`, `seed` (default
   42), `transparent` (RGBA output, Qwen only), `upsample` (write the caption with the prompt upsampler, Klein only),
-  `images` (up to 10 base64 images to edit). See [Models](#models) for what each model accepts; a task option a model
-  does not take is a 400. 400 bad request, 429 `MAX_QUEUED` tasks waiting (with `Retry-After: 30`), 503 shutting down.
+  `images` (up to 10 base64 images to edit, at least 1 and at most 4 on `fibo-edit-turbo`). See [Models](#models) for
+  what each model accepts; a task option a model does not take is a 400. 400 bad request, 429 `MAX_QUEUED` tasks waiting (with `Retry-After: 30`), 503 shutting down.
 - `POST /v1/models/{model}/tasks` is the same with the model taken from the URL, which wins over a `model` in the body.
   404 when the model is unknown or not configured.
 - `GET /v1/models` answers `{"data": [...]}`: what each configured model accepts, whether it is loaded, and its family's
@@ -130,6 +141,9 @@ curl -s localhost:8740/v1/models/flux-klein/tasks -H "$auth" -d '{"prompt": "A n
 python3 -c 'import base64, json, sys; json.dump({"prompt": "Make the sky a sunset", "images": [base64.b64encode(open(sys.argv[1], "rb").read()).decode()]}, sys.stdout)' photo.png > req.json
 curl -s localhost:8740/v1/tasks -H "$auth" --data-binary @req.json
 
+# edit with fibo-edit-turbo: the same body, without a model field
+curl -s localhost:8740/v1/models/fibo-edit-turbo/tasks -H "$auth" --data-binary @req.json
+
 # what the configured models accept
 curl -s localhost:8740/v1/models -H "$auth"
 
@@ -154,19 +168,31 @@ or `i2i` with the reference images when editing. `prompt` goes to the model as s
 With `FLUX_KLEIN_UPSAMPLER_PATH` set, a Klein request can send `"upsample": true` to have the server write the caption
 itself with `flux-3-image-klein-pup`. The caption comes back in `caption` when polling the finished task.
 
+`fibo-edit-turbo` takes a short edit instruction for one image. With several images the instruction refers to them as
+`<image_1>`, `<image_2>` and so on. Put the scene first, as `<image_1>`, then the people, then the products, and send
+`prompt` as a string holding a JSON object with two keys: `short_description`, a caption stating one single subject,
+its pose and the scene, and `edit_instruction`, a short instruction. A plain long instruction with the people reference
+first drew several people. Tested at 1152 × 928 with a six-pose sheet of the model, the caption and short instruction
+gave one person, correct facing and the real room in 6 of 6 renders, and a long instruction in that same place gave 5 of
+6 and left a floating outfit. A caption with no room made the model invent one. See [doc/API.md](doc/API.md#fibo). The
+checkpoint runs with guidance off, so there is no negative prompt. A `prompt` that is itself a JSON object must carry an
+`edit_instruction` key, or the pipeline refuses it and the task ends `FAILED`.
+
 ## Memory
 
-One family stays loaded at a time: `qwen-base` and `qwen-turbo` together, or `flux-klein` with its upsampler. A request
-for the other family unloads the current one and loads its own model first, and the upsampler loads again on the next
-`upsample` request. That load is part of the task, so its `step` stays `null` longer. The queue is strict FIFO, so
-tasks alternating between families pay a full load each time; send a family's tasks together when you can.
+One family stays loaded at a time: `qwen-base` and `qwen-turbo` together, `flux-klein` with its upsampler, or
+`fibo-edit-turbo`. A request for another family unloads the current one and loads its own model first, and the
+upsampler loads again on the next `upsample` request. That load is part of the task, so its `step` stays `null` longer.
+The queue is strict FIFO, so tasks alternating between families pay a full load each time; send a family's tasks
+together when you can.
 
 A client with a stall deadline must not count the `null` stretch as a stall: start that deadline at the first `step`,
 and give the time before it a limit of its own that covers a full load.
 
 Base and Turbo share one text encoder and VAE, but each has its own transformer: both resident take about 44 GB,
 which fits a 64 GB Mac. Configure only one of them on smaller machines. Klein takes about 20 GB of weights in `bf16`,
-and the optional upsampler about 19 GB more.
+and the optional upsampler about 19 GB more. `fibo-edit-turbo` takes about 21 GB idle and peaks at about 25 GB at 1152 × 928 with 4 references, rendering in about
+11 s on an RTX PRO 6000. Above about 1.5 MP it doubled people in all tests, which is why the server refuses that size.
 
 ## Adding a model
 
@@ -188,6 +214,8 @@ its own.
 
 FLUX 3 Image Klein is under the FLUX Kommunity License, a non-commercial license with limited commercial use of outputs
 for qualifying users. Check `LICENSE.md` in the weights before commercial use.
+
+Bria Fibo 2.0 Edit Turbo is under CC BY-NC 4.0, so it is non-commercial. Commercial use needs an agreement with Bria.
 
 ## Tests
 

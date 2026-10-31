@@ -8,10 +8,10 @@ import torch
 
 from ..config import FamilySettings
 from ..schemas import MODELS, GenerateRequest
-from . import flux, qwen
+from . import fibo, flux, qwen
 from .device import empty_cache, patch_mps_empty_cache
 
-ENGINES = {"qwen": qwen, "flux": flux}  # by ModelSpec.family: each has load() and render()
+ENGINES = {"qwen": qwen, "flux": flux, "fibo": fibo}  # by ModelSpec.family: each has load() and render()
 
 
 class ModelRegistry:

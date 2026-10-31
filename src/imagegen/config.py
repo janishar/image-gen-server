@@ -27,6 +27,7 @@ class Settings:
     qwen_base_path: str | None
     qwen_turbo_path: str | None
     flux_klein_path: str | None
+    fibo_edit_turbo_path: str | None
     upsampler_path: str | None
     device: str
     host: str
@@ -42,7 +43,12 @@ class Settings:
     @property
     def model_paths(self) -> dict[str, str]:
         """The configured models, by name."""
-        paths = {"qwen-base": self.qwen_base_path, "qwen-turbo": self.qwen_turbo_path, "flux-klein": self.flux_klein_path}
+        paths = {
+            "qwen-base": self.qwen_base_path,
+            "qwen-turbo": self.qwen_turbo_path,
+            "flux-klein": self.flux_klein_path,
+            "fibo-edit-turbo": self.fibo_edit_turbo_path,
+        }
         return {name: path for name, path in paths.items() if path}
 
 
@@ -111,6 +117,7 @@ def load_settings(env=os.environ) -> Settings:
     qwen_base = _model_dir(env, "QWEN_IMAGE_21_PATH")
     qwen_turbo = _model_dir(env, "QWEN_IMAGE_21_TURBO_PATH")
     flux_klein = _model_dir(env, "FLUX_KLEIN_PATH")
+    fibo_edit_turbo = _model_dir(env, "FIBO_EDIT_TURBO_PATH")
     upsampler = _model_dir(env, "FLUX_KLEIN_UPSAMPLER_PATH")
 
     device = env.get("IMAGEGEN_DEVICE", "").strip() or "auto"
@@ -129,6 +136,7 @@ def load_settings(env=os.environ) -> Settings:
         qwen_base_path=qwen_base,
         qwen_turbo_path=qwen_turbo,
         flux_klein_path=flux_klein,
+        fibo_edit_turbo_path=fibo_edit_turbo,
         upsampler_path=upsampler,
         device=device,
         host=env.get("HOST", "").strip() or "127.0.0.1",
@@ -142,7 +150,7 @@ def load_settings(env=os.environ) -> Settings:
         api_key=_api_key(env),
     )
     if not settings.model_paths:
-        raise ValueError("no model configured: set QWEN_IMAGE_21_PATH, QWEN_IMAGE_21_TURBO_PATH or FLUX_KLEIN_PATH")
+        raise ValueError("no model configured: set QWEN_IMAGE_21_PATH, QWEN_IMAGE_21_TURBO_PATH, FLUX_KLEIN_PATH or FIBO_EDIT_TURBO_PATH")
     for name in settings.preload:
         if name not in settings.model_paths:
             raise ValueError(f"PRELOAD: model {name!r} is not configured (configured: {', '.join(settings.model_paths)})")

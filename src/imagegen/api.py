@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from PIL import Image
 
 from .jobs import COMPLETED, Cancelled, QueueFull, TaskStore
-from .schemas import MAX_IMAGES, MODELS, ValidationError, dump_request, load_images, parse_request
+from .schemas import MODELS, ValidationError, dump_request, load_images, parse_request
 
 MAX_BODY = 64 * 1024 * 1024
 TASKS = "/v1/tasks"
@@ -59,7 +59,6 @@ def model_views(registry) -> list[dict]:
         spec = asdict(MODELS[name])
         spec["options"] = [o for o in spec["options"] if o != "upsample" or registry.can_upsample]
         limits = {
-            "max_images": MAX_IMAGES,
             "max_input_pixels": MODELS[name].max_input_pixels,
             "max_reference_pixels": registry.families[spec["family"]].max_reference_pixels,
         }

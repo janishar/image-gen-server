@@ -29,8 +29,10 @@ AUTH = {"Authorization": f"Bearer {KEY}"}
 
 class FakeRegistry:
     device = "cpu"
-    families = {"qwen": FamilySettings("int8", "bf16", 7 * 1024**2), "flux": FamilySettings("bf16", "fp8", 5 * 1024**2)}
-    precision = {"qwen": {"transformer": "int8", "text_encoder": "bf16"}, "flux": {"transformer": "bf16", "text_encoder": "fp8"}}
+    families = {"qwen": FamilySettings("int8", "bf16", 7 * 1024**2), "flux": FamilySettings("bf16", "fp8", 5 * 1024**2),
+                "fibo": FamilySettings("int8", "int8", 3 * 1024**2)}
+    precision = {"qwen": {"transformer": "int8", "text_encoder": "bf16"}, "flux": {"transformer": "bf16", "text_encoder": "fp8"},
+                 "fibo": {"transformer": "int8", "text_encoder": "int8"}}
 
     def __init__(self, configured=tuple(MODELS), can_upsample=True):
         self.configured = configured
@@ -189,6 +191,13 @@ class TestApi(ServerCase):
             ({"model": "huge"}, "model must be one of"),
             ({"model": "flux-klein", "steps": 101}, "steps must be an integer in 1..100"),
             ({"model": "flux-klein", "images": [b64png((8192, 4097))]}, "over 33554432 pixels"),
+            ({"model": "fibo-edit-turbo"}, "model 'fibo-edit-turbo' edits images: send at least one in images"),
+            ({"model": "fibo-edit-turbo", "images": []}, "model 'fibo-edit-turbo' edits images"),
+            ({"model": "fibo-edit-turbo", "images": [b64png()] * 5}, "at most 4 images"),
+            ({"model": "fibo-edit-turbo", "images": [b64png()], "width": 2768}, "width must be an integer in 64..2752, a multiple of 16"),
+            ({"model": "fibo-edit-turbo", "images": [b64png()], "height": 72}, "height must be an integer in 64..2752, a multiple of 16"),
+            ({"model": "fibo-edit-turbo", "images": [b64png()], "transparent": True}, "model 'fibo-edit-turbo' has no transparent option"),
+            ({"model": "fibo-edit-turbo", "images": [b64png()], "upsample": True}, "model 'fibo-edit-turbo' has no upsample option"),
         ]:
             with self.subTest(fields=str(fields)[:80]):
                 self.assertIn(error, self.assert400({"prompt": "x", **fields}))
@@ -367,11 +376,13 @@ class TestApi(ServerCase):
                 "precision": {
                     "qwen": {"transformer": "int8", "text_encoder": "bf16"},
                     "flux": {"transformer": "bf16", "text_encoder": "fp8"},
+                    "fibo": {"transformer": "int8", "text_encoder": "int8"},
                 },
                 "models": {
                     "qwen-base": {"configured": True, "loaded": False},
                     "qwen-turbo": {"configured": True, "loaded": False},
                     "flux-klein": {"configured": True, "loaded": False},
+                    "fibo-edit-turbo": {"configured": True, "loaded": False},
                 },
                 "upsampler": {"configured": True, "loaded": False},
                 "queued": 0,
@@ -430,21 +441,49 @@ class TestApi(ServerCase):
         self.assertEqual([p for e, p in registry.log if e == "start"], ["p0", "p1"])
 
 
+class TestFiboSize(ServerCase):
+    def test_refuses_sizes_it_cannot_render_whole(self):
+        body = {"prompt": "x", "model": "fibo-edit-turbo", "images": [b64png()]}
+        status, _, data = self.request("POST", "/v1/tasks", {**body, "width": 2304, "height": 1824})
+        self.assertEqual(status, 400)
+        self.assertIn("renders at most", json.loads(data)["error"])
+        self.wait(self.submit({**body, "width": 1152, "height": 928})["task_id"], "COMPLETED")
+        status, _, _ = self.request("POST", "/v1/tasks", {"prompt": "x", "model": "qwen-turbo", "width": 2304, "height": 1824})
+        self.assertEqual(status, 202)  # the cap is Fibo's alone
+
+
 class TestModels(ServerCase):
     def test_lists_models_with_limits(self):
         models = self.models()
-        self.assertEqual(list(models), ["qwen-base", "qwen-turbo", "flux-klein"])
+        self.assertEqual(list(models), ["qwen-base", "qwen-turbo", "flux-klein", "fibo-edit-turbo"])
         self.assertEqual(models["flux-klein"], {
             "id": "flux-klein", "loaded": False, "max_images": 10, "max_input_pixels": 33554432, "family": "flux",
             "precision": {"transformer": "bf16", "text_encoder": "fp8"}, "max_reference_pixels": 5 * 1024**2,
             "ratios": {name: list(size) for name, size in MODELS["flux-klein"].ratios.items()},
             "min_side": 64, "max_side": 4096, "side_multiple": 16, "steps": 16, "max_steps": 16, "options": ["upsample"],
+            "needs_image": False, "max_output_pixels": None,
         })
         self.assertEqual(models["flux-klein"]["ratios"]["16:9"], [1360, 768])
         turbo = models["qwen-turbo"]
         self.assertEqual((turbo["family"], turbo["min_side"], turbo["max_side"], turbo["side_multiple"]), ("qwen", 256, 2752, 32))
         self.assertEqual((turbo["steps"], turbo["max_steps"], turbo["options"]), (40, 100, ["transparent"]))
         self.assertEqual(turbo["ratios"]["16:9"], [2752, 1536])
+        self.assertEqual((turbo["max_images"], turbo["needs_image"]), (10, False))
+        self.assertIsNone(turbo["max_output_pixels"])
+        self.assertEqual(models["fibo-edit-turbo"], {
+            "id": "fibo-edit-turbo", "loaded": False, "max_images": 4, "max_input_pixels": 15147008, "family": "fibo",
+            "precision": {"transformer": "int8", "text_encoder": "int8"}, "max_reference_pixels": 3 * 1024**2,
+            "ratios": {name: list(size) for name, size in MODELS["flux-klein"].ratios.items()},
+            "min_side": 64, "max_side": 2752, "side_multiple": 16, "steps": 4, "max_steps": 4, "options": [],
+            "needs_image": True, "max_output_pixels": 1572864,
+        })
+
+    def test_fibo_edit_turbo_route(self):
+        status, _, data = self.request("POST", "/v1/models/fibo-edit-turbo/tasks", {"prompt": "make it red", "images": [b64png()] * 4})
+        self.assertEqual(status, 202)
+        self.assertEqual(self.wait(json.loads(data)["data"]["task_id"], "COMPLETED")["model"], "fibo-edit-turbo")
+        status, _, _ = self.request("POST", "/v1/models/fibo-edit-turbo/tasks", {"prompt": "make it red"})
+        self.assertEqual(status, 400)
 
     def test_settings_per_family(self):
         models = self.models()
@@ -532,7 +571,7 @@ class TestFluxKleinOnly(ServerCase):
                 self.assertEqual((status, json.loads(data)["error"]), (404, f"model {model!r} is not configured"))
         models = json.loads(self.request("GET", "/health")[2])["models"]
         self.assertEqual({n for n, m in models.items() if m["configured"]}, {"flux-klein"})
-        self.assertEqual(set(models), {"qwen-base", "qwen-turbo", "flux-klein"})
+        self.assertEqual(set(models), {"qwen-base", "qwen-turbo", "flux-klein", "fibo-edit-turbo"})
 
 
 class TestQueueFull(ServerCase):
@@ -747,12 +786,12 @@ class TestConfig(unittest.TestCase):
 
     def test_family_defaults(self):
         default = FamilySettings("bf16", "bf16", 10 * 1024**2)
-        self.assertEqual(self.families(), {"qwen": default, "flux": default})  # a family has settings before it has a path
+        self.assertEqual(self.families(), {"qwen": default, "flux": default, "fibo": default})  # a family has settings before it has a path
 
     def test_shared_keys_cover_every_family(self):
         shared = FamilySettings("int8", "int8", 7340032)
         families = self.families(TRANSFORMER_PRECISION="int8", TEXT_ENCODER_PRECISION=" int8 ", MAX_REFERENCE_PIXELS="7340032")
-        self.assertEqual(families, {"qwen": shared, "flux": shared})
+        self.assertEqual(families, {"qwen": shared, "flux": shared, "fibo": shared})
         families = self.families(TRANSFORMER_PRECISION="fp8_dynamic", TEXT_ENCODER_PRECISION="fp8")
         self.assertEqual(families["flux"], FamilySettings("fp8_dynamic", "fp8", 10 * 1024**2))
 
@@ -801,6 +840,15 @@ class TestConfig(unittest.TestCase):
         self.assertEqual((s.model_paths, s.upsampler_path), ({"flux-klein": self.base}, None))
         s = load_settings({"FLUX_KLEIN_PATH": self.base, "FLUX_KLEIN_UPSAMPLER_PATH": self.tmp.name, "IMAGEGEN_API_KEY": KEY, "PRELOAD": "flux-klein"})
         self.assertEqual((s.upsampler_path, s.preload), (self.tmp.name, ("flux-klein",)))
+
+    def test_fibo_edit_turbo(self):
+        s = load_settings({"FIBO_EDIT_TURBO_PATH": self.base, "IMAGEGEN_API_KEY": KEY, "PRELOAD": "fibo-edit-turbo"})
+        self.assertEqual((s.model_paths, s.preload), ({"fibo-edit-turbo": self.base}, ("fibo-edit-turbo",)))
+        families = self.families(TRANSFORMER_PRECISION="fp8", FIBO_TRANSFORMER_PRECISION="int8", FIBO_MAX_REFERENCE_PIXELS="1048576")
+        self.assertEqual(families["fibo"], FamilySettings("int8", "bf16", 1048576))
+        self.assertEqual(families["qwen"].transformer_precision, "fp8")
+        with self.assertRaisesRegex(ValueError, "FIBO_EDIT_TURBO_PATH"):
+            load_settings({"FIBO_EDIT_TURBO_PATH": os.path.join(self.tmp.name, "missing"), "IMAGEGEN_API_KEY": KEY})
 
     def test_no_model(self):
         with self.assertRaisesRegex(ValueError, "no model configured"):
@@ -953,23 +1001,23 @@ class TestFluxEngine(unittest.TestCase):
         self.assertEqual(flux.canvas_line(1024, 1024), "TARGET CANVAS: 1:1\n")
 
     def test_one_reference_untouched(self):
-        from imagegen.engine import flux
+        from imagegen.engine.common import fit_references
 
         img = Image.new("RGB", (3000, 2000))
-        self.assertIs(flux.fit_references([img], 1024**2)[0], img)  # the pipeline fits a single one itself
+        self.assertIs(fit_references([img], 1024**2)[0], img)  # the pipeline fits a single one itself
 
     def test_references_under_budget_unchanged(self):
-        from imagegen.engine import flux
+        from imagegen.engine.common import fit_references
 
         images = [Image.new("RGB", (2000, 2000)) for _ in range(3)]
-        self.assertIs(flux.fit_references(images, 10 * 1024**2), images)
+        self.assertIs(fit_references(images, 10 * 1024**2), images)
         images = images[:2] * 5  # 10 at 1024x1024 fit in 10 MP exactly
-        self.assertIs(flux.fit_references(images, 10 * 1024**2), images)
+        self.assertIs(fit_references(images, 10 * 1024**2), images)
 
     def test_references_shrink_to_budget(self):
-        from imagegen.engine import flux
+        from imagegen.engine.common import fit_references
 
-        out = flux.fit_references([Image.new("RGB", (2000, 1000))] * 10, 7 * 1024**2)
+        out = fit_references([Image.new("RGB", (2000, 1000))] * 10, 7 * 1024**2)
         self.assertEqual(len(out), 10)
         for img in out:
             self.assertAlmostEqual(img.width * img.height, 832**2, delta=832**2 * 0.01)
@@ -977,11 +1025,11 @@ class TestFluxEngine(unittest.TestCase):
         self.assertLessEqual(sum(img.width * img.height for img in out), 7 * 1024**2)
 
     def test_small_references_never_upscale(self):
-        from imagegen.engine import flux
+        from imagegen.engine.common import fit_references
 
         small = Image.new("RGB", (100, 100))
         large = Image.new("RGB", (2000, 2000))
-        out = flux.fit_references([small, large] * 5, 7 * 1024**2)
+        out = fit_references([small, large] * 5, 7 * 1024**2)
         self.assertIs(out[0], small)
         self.assertEqual(out[1].size, (832, 832))
 
@@ -1000,11 +1048,76 @@ class TestFluxEngine(unittest.TestCase):
         pipe.transformer.register_forward_hook.return_value.remove.assert_called_once()
 
 
+class TestFiboEngine(unittest.TestCase):
+    def render(self, on_step=None, budget=10 * 1024**2, **fields):
+        from imagegen.engine import fibo
+
+        result = Image.new("RGB", (8, 8))
+        pipe = mock.MagicMock(num_timesteps=4)
+        pipe.return_value.images = [result]
+        req = GenerateRequest(**{"prompt": "make it red", "model": "fibo-edit-turbo", "steps": 4, "seed": 7, **fields})
+        with mock.patch("builtins.print"):
+            def run(**kw):
+                for i in range(4):
+                    kw["callback_on_step_end"](pipe, i, None, {})
+                return pipe.return_value
+
+            pipe.side_effect = run
+            out = fibo.render(pipe, req, on_step, budget)
+        self.assertEqual(out, (result, 4, None))
+        return pipe.call_args.kwargs
+
+    def test_render(self):
+        import inspect
+
+        import diffusers
+
+        images = (Image.new("RGB", (1024, 1024)), Image.new("RGB", (512, 512)))
+        steps = []
+        kw = self.render(lambda done, total: steps.append((done, total)), images=images)
+        self.assertEqual(kw["prompt"], "make it red")
+        self.assertEqual(kw["image"], list(images))
+        self.assertEqual((kw["guidance_scale"], kw["num_inference_steps"]), (1.0, 4))
+        self.assertEqual((kw["width"], kw["height"]), (None, None))  # the pipeline sizes from the first image
+        self.assertEqual(kw["generator"].initial_seed(), 7)
+        self.assertEqual(steps, [(1, 4), (2, 4), (3, 4), (4, 4)])
+        self.assertLessEqual(set(kw), set(inspect.signature(diffusers.BriaFibo2Pipeline.__call__).parameters))
+
+    def test_size(self):
+        images = (Image.new("RGB", (16, 16)),)
+        kw = self.render(images=images, ratio="16:9")
+        self.assertEqual((kw["width"], kw["height"]), (1360, 768))
+        kw = self.render(images=images, ratio="16:9", width=512)
+        self.assertEqual((kw["width"], kw["height"]), (512, 768))
+
+    def test_reference_budget(self):
+        images = (Image.new("RGB", (2000, 2000)),) * 4
+        self.assertEqual({img.size for img in self.render(images=images, budget=1024**2)["image"]}, {(512, 512)})
+
+    def test_load_quantizes_transformer_and_text_encoder(self):
+        import diffusers
+        import torch
+        import transformers
+
+        from imagegen.engine import fibo
+
+        with mock.patch.object(diffusers.BriaFibo2Pipeline, "from_pretrained") as fp:
+            fibo.load("/m", "cuda", [], "int8", "fp8")
+            fibo.load("/m", "cuda", [], "bf16", "bf16")
+        quantized, plain = fp.call_args_list
+        mapping = quantized.kwargs["quantization_config"].quant_mapping
+        self.assertIs(type(mapping["transformer"]), diffusers.TorchAoConfig)
+        self.assertIs(type(mapping["text_encoder"]), transformers.TorchAoConfig)
+        self.assertEqual(plain.args, ("/m",))
+        self.assertEqual(plain.kwargs, {"dtype": torch.bfloat16, "device_map": "cuda"})
+
+
 class TestModelRegistry(unittest.TestCase):
     """The real registry with stub engines patched in: no weights."""
 
-    PATHS = {"qwen-base": "/base", "qwen-turbo": "/turbo", "flux-klein": "/klein"}
-    FAMILIES = {"qwen": FamilySettings("int8", "bf16", 123), "flux": FamilySettings("fp8", "fp8", 456)}
+    PATHS = {"qwen-base": "/base", "qwen-turbo": "/turbo", "flux-klein": "/klein", "fibo-edit-turbo": "/fibo"}
+    FAMILIES = {"qwen": FamilySettings("int8", "bf16", 123), "flux": FamilySettings("fp8", "fp8", 456),
+                "fibo": FamilySettings("bf16", "int8", 789)}
 
     def setUp(self):
         from imagegen.engine import registry
@@ -1026,7 +1139,7 @@ class TestModelRegistry(unittest.TestCase):
             return "image", req.steps, "caption" if req.upsample else None
 
         stub = SimpleNamespace(load=load, render=render)
-        for patcher in (mock.patch.dict(registry.ENGINES, {"qwen": stub, "flux": stub}),
+        for patcher in (mock.patch.dict(registry.ENGINES, {"qwen": stub, "flux": stub, "fibo": stub}),
                         mock.patch.object(registry, "print", create=True)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -1054,6 +1167,7 @@ class TestModelRegistry(unittest.TestCase):
             "qwen-base": {"configured": True, "loaded": False},
             "qwen-turbo": {"configured": False, "loaded": False},
             "flux-klein": {"configured": True, "loaded": False},
+            "fibo-edit-turbo": {"configured": False, "loaded": False},
         })
         self.assertEqual(self.registry.upsampler_status(), {"configured": True, "loaded": False})
 
@@ -1071,7 +1185,29 @@ class TestModelRegistry(unittest.TestCase):
         self.registry.get("flux-klein")
         self.assertEqual(self.loads[-1], ("/klein", []))
         self.assertEqual(self.loaded(), {"flux-klein"})
-        self.assertEqual({m["id"]: m["loaded"] for m in model_views(self.registry)}, {"qwen-base": False, "qwen-turbo": False, "flux-klein": True})
+        self.assertEqual({m["id"]: m["loaded"] for m in model_views(self.registry)}, {"qwen-base": False, "qwen-turbo": False, "flux-klein": True, "fibo-edit-turbo": False})
+
+    def test_three_families_evict_each_other(self):
+        self.upsample_flux_klein()
+        self.registry.get("fibo-edit-turbo")
+        self.assertEqual(self.loads[-1], ("/fibo", []))
+        self.assertEqual(self.loaded(), {"fibo-edit-turbo"})
+        self.assertEqual(self.registry.upsampler_status(), {"configured": True, "loaded": False})
+        self.registry.get("qwen-base")
+        self.registry.get("qwen-turbo")
+        self.assertEqual(self.loaded(), {"qwen-base", "qwen-turbo"})
+        self.registry.get("fibo-edit-turbo")
+        self.assertEqual(self.loads[-1], ("/fibo", []))
+        self.assertEqual(self.loaded(), {"fibo-edit-turbo"})
+        self.registry.get("flux-klein")
+        self.assertEqual(self.loaded(), {"flux-klein"})
+        self.assertEqual(self.precisions[1], ("/fibo", "bf16", "int8"))
+
+    def test_engines_cover_every_family(self):
+        from imagegen.engine import fibo, registry
+
+        self.assertIs(registry.fibo, fibo)
+        self.assertEqual({m.family for m in MODELS.values()}, set(registry.ENGINES))
 
     def test_qwen_evicts_flux_klein_and_upsampler(self):
         self.upsample_flux_klein()
@@ -1130,9 +1266,10 @@ class TestModelRegistry(unittest.TestCase):
     def test_reports_per_family(self):
         qwen = {"transformer": "int8", "text_encoder": "bf16"}
         flux = {"transformer": "fp8", "text_encoder": "fp8"}
-        self.assertEqual(self.registry.precision, {"qwen": qwen, "flux": flux})
+        fibo = {"transformer": "bf16", "text_encoder": "int8"}
+        self.assertEqual(self.registry.precision, {"qwen": qwen, "flux": flux, "fibo": fibo})
         views = {m["id"]: (m["precision"], m["max_reference_pixels"]) for m in model_views(self.registry)}
-        self.assertEqual(views, {"qwen-base": (qwen, 123), "qwen-turbo": (qwen, 123), "flux-klein": (flux, 456)})
+        self.assertEqual(views, {"qwen-base": (qwen, 123), "qwen-turbo": (qwen, 123), "flux-klein": (flux, 456), "fibo-edit-turbo": (fibo, 789)})
 
 
 class TestSchemas(unittest.TestCase):
@@ -1166,6 +1303,19 @@ class TestSchemas(unittest.TestCase):
         self.assertEqual(len(parse_request({"prompt": "hi", "model": "flux-klein", "images": [over_qwen]}, MODELS).images), 1)
         with self.assertRaises(ValidationError):
             parse_request({"prompt": "hi", "model": "qwen-turbo", "images": [over_qwen]}, MODELS)
+
+    def test_fibo_edit_turbo(self):
+        edit = {"prompt": "hi", "model": "fibo-edit-turbo", "images": [b64png()]}
+        req = parse_request(edit, MODELS)
+        self.assertEqual((req.steps, req.seed, len(req.images)), (4, 42, 1))
+        self.assertEqual(parse_request({**edit, "steps": 40}, MODELS).steps, 4)
+        self.assertEqual(len(parse_request({**edit, "images": [b64png()] * 4}, MODELS).images), 4)
+        self.assertEqual(parse_request({**edit, "width": 2752, "height": 64}, MODELS).width, 2752)
+        self.assertEqual(MODELS["fibo-edit-turbo"].ratios, MODELS["flux-klein"].ratios)
+        self.assertEqual(parse_request(json.loads(json.dumps(dump_request(req))), MODELS), req)
+        with self.assertRaisesRegex(ValidationError, "edits images"):  # the default model when it is the only one
+            parse_request({"prompt": "hi"}, ("fibo-edit-turbo",))
+        self.assertEqual(len(parse_request({"prompt": "hi", "images": [b64png()] * 10}, MODELS).images), 10)  # others keep 10
 
     def test_options(self):
         klein = parse_request({"prompt": "hi", "model": "flux-klein", "upsample": True}, MODELS)

@@ -2,7 +2,8 @@
 
 How to integrate a client with the imagegen server: submit a render task, poll it, and download the PNG.
 
-The server renders Qwen-Image-2.1 (`qwen-base`, `qwen-turbo`) and FLUX 3 Image Klein (`flux-klein`) images on one GPU.
+The server renders Qwen-Image-2.1 (`qwen-base`, `qwen-turbo`) and FLUX 3 Image Klein (`flux-klein`) images, and edits
+images with Bria Fibo 2.0 Edit Turbo (`fibo-edit-turbo`), on one GPU.
 It works on **one task at a time**, first in, first out. Each model loads on the first request that needs it and stays
 in memory until a model of another family is asked for (see [Memory](#memory)). Tasks are stored in SQLite, so waiting
 tasks and finished images survive a restart.
@@ -33,16 +34,16 @@ validates the body before queueing it, so a `202` means the task was accepted.
 
 | Field | Type | Default | Rules |
 | --- | --- | --- | --- |
-| `prompt` | string | required | Must not be empty. Long prompts (several thousand characters) are fine. |
-| `model` | string | `"qwen-turbo"` | `"qwen-base"`, `"qwen-turbo"` or `"flux-klein"`. It must be configured on the server (see [`GET /v1/models`](#get-v1models)). When the server has no `"qwen-turbo"`, the default is the first configured model. |
+| `prompt` | string | required | Must not be empty. Long prompts (several thousand characters) are fine, except on Fibo, where text and images share 4,096 tokens. On Fibo, with several images, it is a string holding a JSON object; see [Fibo](#fibo). |
+| `model` | string | `"qwen-turbo"` | `"qwen-base"`, `"qwen-turbo"`, `"flux-klein"` or `"fibo-edit-turbo"`. It must be configured on the server (see [`GET /v1/models`](#get-v1models)). When the server has no `"qwen-turbo"`, the default is the first configured model. |
 | `ratio` | string | see [Size](#size) | `1:1`, `4:3`, `3:4`, `3:2`, `2:3`, `16:9`, `9:16` |
-| `width` | integer | see [Size](#size) | Qwen: 256–2752, a multiple of 32. Klein: 64–4096, a multiple of 16. |
+| `width` | integer | see [Size](#size) | Qwen: 256–2752, a multiple of 32. Klein: 64–4096, a multiple of 16. Fibo: 64–2752, a multiple of 16. |
 | `height` | integer | see [Size](#size) | Same as `width`. |
-| `steps` | integer | `40`, Klein `16` | 1–100. Turbo ignores it and always runs 8 steps. Klein runs at most 16, the number the checkpoint is distilled for, so a longer request is cut to 16. |
+| `steps` | integer | `40`, Klein `16`, Fibo `4` | 1–100. Turbo ignores it and always runs 8 steps. Klein runs at most 16, the number the checkpoint is distilled for, so a longer request is cut to 16. Fibo likewise runs at most 4. |
 | `seed` | integer | `42` | 0 to 2^63−1. The same request with the same seed gives the same image. |
 | `transparent` | boolean | `false` | Qwen only. Adds instructions to the prompt asking for a transparent background (RGBA alpha channel). |
 | `upsample` | boolean | `false` | Klein only. `true` expands `prompt` into a full scene caption with the prompt upsampler, using the references when editing. Otherwise `prompt` goes to the model as sent, so it should already be a full caption. `true` is a 400 when the server has no upsampler (see `/health`). |
-| `images` | array of strings | `[]` | Up to 10 base64-encoded images (PNG, JPEG, WebP…). Any number of them turns the task into an edit or reference-guided render. Each must be at most 15,147,008 pixels on Qwen, 33,554,432 on Klein. |
+| `images` | array of strings | `[]` | Up to 10 base64-encoded images (PNG, JPEG, WebP…), or up to 4 on Fibo. Any number of them turns the task into an edit or reference-guided render. Fibo only edits, so it needs at least 1: a request with none is a `400`. Each must be at most 15,147,008 pixels on Qwen and Fibo, 33,554,432 on Klein. |
 
 Unknown fields are rejected. A boolean is not accepted where an integer is expected. An option a model does not take
 is a `400` when set to `true`, for example `"transparent": true` on Klein; `false` is accepted on every model, so a
@@ -74,7 +75,7 @@ wins over a `model` in the body. A model that is unknown or not configured gets 
 ### GET /v1/models
 
 This lists what each configured model accepts, as `{"data": [...]}` in the order `qwen-base`, `qwen-turbo`,
-`flux-klein`. Unconfigured models are left out. It needs the key.
+`flux-klein`, `fibo-edit-turbo`. Unconfigured models are left out. It needs the key.
 
 ```json
 {
@@ -83,7 +84,6 @@ This lists what each configured model accepts, as `{"data": [...]}` in the order
       "id": "flux-klein",
       "loaded": false,
       "precision": {"transformer": "bf16", "text_encoder": "bf16"},
-      "max_images": 10,
       "max_input_pixels": 33554432,
       "max_reference_pixels": 10485760,
       "family": "flux",
@@ -93,7 +93,9 @@ This lists what each configured model accepts, as `{"data": [...]}` in the order
       "side_multiple": 16,
       "steps": 16,
       "max_steps": 16,
-      "options": ["upsample"]
+      "options": ["upsample"],
+      "max_images": 10,
+      "needs_image": false
     }
   ]
 }
@@ -104,10 +106,12 @@ This lists what each configured model accepts, as `{"data": [...]}` in the order
 | `id` | The name to send as `model`. |
 | `loaded` | Whether the model is in memory now. |
 | `precision` | The weight precision of the transformer and text encoder, the same for every model of a family. See [`GET /health`](#get-health). |
-| `max_images` | The most reference images a request can send. |
+| `max_images` | The most reference images a request can send: 10, or 4 on `fibo-edit-turbo`. |
+| `max_output_pixels` | The largest output in pixels, or `null` when only `max_side` limits it. |
+| `needs_image` | `true` when a request must send at least one image, as `fibo-edit-turbo` must. |
 | `max_input_pixels` | The largest reference image, in pixels. |
-| `max_reference_pixels` | The total reference pixels of a request, the same for every model of a family. Past it every reference shrinks evenly. For `flux-klein` the cap only applies with several references: a single reference keeps the pipeline's own 4 MP limit. See [Size](#size). |
-| `family` | `qwen` or `flux`. One family stays loaded at a time (see [Memory](#memory)). |
+| `max_reference_pixels` | The total reference pixels of a request, the same for every model of a family. Past it every reference shrinks evenly. For `flux-klein` the cap only applies with several references: a single reference keeps the pipeline's own 4 MP limit. `fibo-edit-turbo` scales references back up, so the cap saves it no memory. See [Size](#size). |
+| `family` | `qwen`, `flux` or `fibo`. One family stays loaded at a time (see [Memory](#memory)). |
 | `ratios` | Each `ratio` and its `[width, height]`. |
 | `min_side`, `max_side`, `side_multiple` | The rules for `width` and `height`. |
 | `steps`, `max_steps` | The default when a request sends none, and the most that run. Turbo reports the Qwen values, `40` and `100`, but always runs 8. |
@@ -158,9 +162,9 @@ the alpha channel. Each JPEG is encoded when you ask for it. Any other `format` 
 
 | Header | Value |
 | --- | --- |
-| `X-Model` | `qwen-base`, `qwen-turbo` or `flux-klein` |
+| `X-Model` | `qwen-base`, `qwen-turbo`, `flux-klein` or `fibo-edit-turbo` |
 | `X-Seed` | the seed used |
-| `X-Steps` | the number of denoising steps actually run (always 8 for Turbo, at most 16 for Klein) |
+| `X-Steps` | the number of denoising steps actually run (always 8 for Turbo, at most 16 for Klein, at most 4 for Fibo) |
 | `X-Elapsed-Ms` | the render time (same as `elapsed_ms`) |
 
 Downloading doesn't delete anything, so a retry is safe until the task expires. Other responses:
@@ -181,12 +185,14 @@ This shows which models and upsampler are configured and loaded, and how busy th
   "device": "mps",
   "precision": {
     "qwen": {"transformer": "int8", "text_encoder": "int8"},
-    "flux": {"transformer": "bf16", "text_encoder": "bf16"}
+    "flux": {"transformer": "bf16", "text_encoder": "bf16"},
+    "fibo": {"transformer": "bf16", "text_encoder": "bf16"}
   },
   "models": {
     "qwen-base": {"configured": true, "loaded": true},
     "qwen-turbo": {"configured": true, "loaded": false},
-    "flux-klein": {"configured": false, "loaded": false}
+    "flux-klein": {"configured": false, "loaded": false},
+    "fibo-edit-turbo": {"configured": false, "loaded": false}
   },
   "upsampler": {"configured": false, "loaded": false},
   "queued": 1,
@@ -207,9 +213,9 @@ server.
 
 The output size comes from these fields, in this order:
 
-1. `ratio` picks one of these presets, about 4 MP for Qwen and about 1 MP for Klein:
+1. `ratio` picks one of these presets, about 4 MP for Qwen and about 1 MP for Klein and Fibo:
 
-   | ratio | Qwen width × height | Klein width × height |
+   | ratio | Qwen width × height | Klein and Fibo width × height |
    | --- | --- | --- |
    | 1:1 | 2048 × 2048 | 1024 × 1024 |
    | 4:3 | 2400 × 1792 | 1152 × 864 |
@@ -224,26 +230,72 @@ The output size comes from these fields, in this order:
      the ~4 MP presets.
    - Klein keeps the size of the **first** input image, after it is fitted under 4 MP for one reference or 1 MP for
      several.
+   - Fibo keeps the aspect of the **first** input image at about **1 MP**, the size it was trained at.
 3. `width` and `height` each replace only their own side. The other side still comes from step 1 or 2, so sending
-   one alone usually changes the aspect. Send **both** to get an exact size.
+   one alone usually changes the aspect. On Fibo with no `ratio`, the other side is 1024 instead. Send **both** to get
+   an exact size.
 
 For any other aspect ratio or size, compute it yourself and send both `width` and `height`. On Qwen, round each to a
 multiple of 32, and keep each between 256 and 2752. For example, 4:5 at about 1 MP is `896 × 1120`, and 21:9 at
 about 2 MP is `2176 × 928`. The largest Qwen output is 2752 on a side, so there's no 4K output. Upscale on the client
-if you need more. On Klein, round each to a multiple of 16, and keep each between 64 and 4096. Larger sizes take much
-more memory and time.
+if you need more. On Klein, round each to a multiple of 16, and keep each between 64 and 4096. On Fibo, round each to a
+multiple of 16, and keep each between 64 and 2752; it was trained at about 1 MP. Larger sizes take much more memory and
+time.
 
 The server caps the total reference pixels of a request per family, with `MAX_REFERENCE_PIXELS` for every family or
-`QWEN_MAX_REFERENCE_PIXELS` and `FLUX_MAX_REFERENCE_PIXELS` for one. `GET /v1/models` reports the cap as
+`QWEN_MAX_REFERENCE_PIXELS`, `FLUX_MAX_REFERENCE_PIXELS` and `FIBO_MAX_REFERENCE_PIXELS` for one. `GET /v1/models` reports the cap as
 `max_reference_pixels`. For `flux-klein` the cap only applies with several references: a single reference keeps the
 pipeline's own 4 MP limit. When the cap leaves each reference less than 1 MP, a request with no size gets a smaller
 output too: on Qwen with any number of references, on `flux-klein` with several.
 
+Fibo prepares references itself: one reference is scaled to cover the output size and center-cropped to it, so an output
+of another aspect loses the edges, and several are each cropped to about 1 MP at their own aspect. The cap applies with
+several references, but they are then scaled back up, so a tight cap loses detail and saves no memory.
+
+## Fibo
+
+`fibo-edit-turbo` only edits, with at least 1 and at most 4 `images`. Its repo is gated behind Bria's access form, and
+it is under CC BY-NC 4.0, so it is non-commercial: commercial use needs an agreement with Bria.
+
+It renders at most about 1.5 MP, and a larger `width` and `height` get a `400`: it was trained at about 1 MP, at 4 MP
+it drew two people in one frame, and above about 1.5 MP it doubled people in all tests.
+
+With one image, send a short edit instruction as `prompt`. With several, the instruction refers to them as `<image_1>`,
+`<image_2>` and so on, in the order of `images`:
+
+1. Put the scene first, as `<image_1>`, then the people, then the products.
+2. Send `prompt` as a string holding a JSON object with two keys: `short_description`, a caption stating one single
+   subject, its pose and the scene, and `edit_instruction`, a short instruction.
+
+```json
+{
+  "short_description": "One single woman standing full-length, {facing}, wearing {outfit}, in this exact room: {background_notes} Exactly one person in the image.",
+  "edit_instruction": "Add one woman to <image_1>, keeping the room exactly as it is, with every wall, the floor and the chair in place. She is the woman from <image_2>, which shows the same woman from six angles, so draw her only once, {facing}. Dress her in {outfit}, exactly as shown in <image_3> and <image_4>, replacing her black clothes. Full length, head to toe. Soft diffused daylight, real cloth with a visible weave, natural unretouched skin."
+}
+```
+
+Measured at 1152 × 928, with a six-pose sheet as the model reference:
+
+| Request | Result |
+| --- | --- |
+| A plain long instruction, people reference first | Several people |
+| Scene first, the caption and short instruction above | One person, correct facing and the real room in 6 of 6 renders |
+| Scene first, the same caption, a long instruction as `edit_instruction` | 5 of 6, and a floating outfit left in the image |
+| A caption with no room | The model invented a different room |
+
+So a sheet of several poses works as a reference when the caption and instruction say to draw one subject.
+
+The checkpoint runs with guidance off, so there is no negative prompt. A `prompt` that is itself a JSON object must carry
+an `edit_instruction` key: without one it passes validation, the pipeline refuses it and the task ends `FAILED`.
+
+Text and images share 4,096 tokens, and 4 references can take up to about 2,300 of them. A longer prompt loses its end
+with no error, so keep what must survive near the start, especially in non-Latin scripts, which take more tokens.
+
 ## Memory
 
-One family stays loaded at a time: `qwen-base` and `qwen-turbo` together, or `flux-klein` with its upsampler. A request
-for the other family unloads the current one and loads its own model first. The upsampler loads on the first
-`"upsample": true` request after that, and leaves with `flux-klein`.
+One family stays loaded at a time: `qwen-base` and `qwen-turbo` together, `flux-klein` with its upsampler, or
+`fibo-edit-turbo`. A request for another family unloads the current one and loads its own model first. The upsampler
+loads on the first `"upsample": true` request after that, and leaves with `flux-klein`.
 
 That load is part of the task. The task is `IN_PROGRESS` from `started_at`, and its `step` stays `null` until the load,
 and any upsampling, is done, so longer than usual. The queue is strict first in, first out, so tasks alternating
@@ -256,7 +308,8 @@ they were still in the OS file cache. A swap has not been timed on a CUDA GPU.
 ## Timing
 
 These were measured on an Apple M-series Mac (MPS) with 64 GB of memory. No GPU (CUDA) timing has been measured for
-Klein.
+Klein. `fibo-edit-turbo` takes about 21 GB idle and peaks at about 25 GB at 1152 × 928 with 4 references, rendering in about
+11 s on an RTX PRO 6000. Above about 1.5 MP it doubled people in all tests, which is why the server refuses that size.
 
 | Render | Time |
 | --- | --- |
@@ -310,8 +363,8 @@ tens of minutes, so set client deadlines with that in mind (see below).
 5. **On `FAILED`**, raise with `error` as the message.
 6. **Download right away** after `COMPLETED`, and store the bytes on your side. The server only keeps results for
    `TASK_TTL` seconds.
-7. **Reference images:** send at most 10, as base64, ordered by importance. If you send more, the server returns
-   400; it doesn't drop the extras itself.
+7. **Reference images:** send at most the model's `max_images`, as base64, ordered by importance. If you send more,
+   the server returns 400; it doesn't drop the extras itself.
 
 ### Python example (async, httpx)
 

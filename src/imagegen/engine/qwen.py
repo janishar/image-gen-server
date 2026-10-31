@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 
 from ..schemas import MODELS, GenerateRequest
-from .common import quant_config, reference_side
+from .common import pipeline_quantization, reference_side, step_callback
 
 SHARED = ("text_encoder", "vae", "processor")
 
@@ -38,19 +38,8 @@ def load_pipeline(path: str, device: str, shared: dict | None = None, transforme
     from diffusers import QwenImage21Pipeline  # type: ignore[import-not-found]
 
     kwargs = dict(shared or {})
-    mapping = {}
-    if (transformer, text_encoder) != ("bf16", "bf16"):
-        import diffusers
-        import transformers
-
-        if transformer != "bf16":
-            mapping["transformer"] = quant_config(diffusers, transformer)
-        if text_encoder != "bf16" and "text_encoder" not in kwargs:  # a shared one is already loaded as it is
-            mapping["text_encoder"] = quant_config(transformers, text_encoder)
-    if mapping:
-        from diffusers.quantizers import PipelineQuantizationConfig
-
-        kwargs["quantization_config"] = PipelineQuantizationConfig(quant_mapping=mapping)
+    # a shared text encoder is already loaded as it is
+    kwargs.update(pipeline_quantization(transformer, "bf16" if "text_encoder" in kwargs else text_encoder))
     # device_map loads each weight straight to the GPU; passed components are used as-is, so only the rest load.
     # ponytail: assumes both checkpoints ship the same text_encoder/vae (file sizes match); load separately if not
     return QwenImage21Pipeline.from_pretrained(path, dtype=torch.bfloat16, device_map=device, **kwargs)
@@ -94,13 +83,6 @@ def load(path: str, device: str, loaded: list, transformer: str, text_encoder: s
 def render(pipe, req: GenerateRequest, on_step=None, max_reference_pixels: int = 10 * 1024**2) -> tuple[Image.Image, int, None]:
     """Run `req` through `pipe`, calling on_step(done, total) after each step; returns the image, the steps run and
     no caption (only Klein writes one)."""
-
-    def on_step_end(p, i: int, t, kwargs: dict) -> dict:
-        print(f"@step {i + 1}/{p.num_timesteps}", flush=True)
-        if on_step:
-            on_step(i + 1, p.num_timesteps)
-        return kwargs
-
     images = list(req.images) or None
     ratio = req.ratio or (None if images else "1:1")
     width, height = MODELS[req.model].ratios[ratio] if ratio else (None, None)
@@ -119,7 +101,7 @@ def render(pipe, req: GenerateRequest, on_step=None, max_reference_pixels: int =
         height=height,
         num_inference_steps=req.steps,
         generator=torch.Generator(device="cpu").manual_seed(noise_seed(req.seed, images)),
-        callback_on_step_end=on_step_end,
+        callback_on_step_end=step_callback(on_step),
         # ponytail: a budget tight enough to shrink references also shrinks the output when no size is sent; ORA sends one
         output_resolution=reference_side(len(images or ()), max_reference_pixels),
     ).images[0]
