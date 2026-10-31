@@ -14,7 +14,7 @@ download the PNG.
 | `qwen-base` | Qwen | 256..2752, multiples of 32 | about 4 MP | default 40, max 100 | `transparent` |
 | `qwen-turbo` | Qwen | 256..2752, multiples of 32 | about 4 MP | taken, but always runs its own 8-step schedule | `transparent` |
 | `flux-klein` | Flux | 64..4096, multiples of 16 | about 1 MP | default 16, max 16 (a longer request is cut to 16) | `upsample`, with `FLUX_KLEIN_UPSAMPLER_PATH` |
-| `fibo-edit-turbo` | Fibo | 64..2752, multiples of 16 | about 1 MP | default 4, max 4 (a longer request is cut to 4) | none |
+| `fibo-edit-turbo` | Fibo | 64..2752, multiples of 16; above about 1.5 MP it renders at about 1 MP | about 1 MP | default 4, max 4 (a longer request is cut to 4) | none |
 
 Every model takes the ratios `1:1`, `4:3`, `3:4`, `3:2`, `2:3`, `16:9`, `9:16`, but the same ratio means a different
 size per family: `16:9` is 2752×1536 on Qwen and 1360×768 on Klein and Fibo. `GET /v1/models` lists all of this for the
@@ -192,7 +192,7 @@ and give the time before it a limit of its own that covers a full load.
 Base and Turbo share one text encoder and VAE, but each has its own transformer: both resident take about 44 GB,
 which fits a 64 GB Mac. Configure only one of them on smaller machines. Klein takes about 20 GB of weights in `bf16`,
 and the optional upsampler about 19 GB more. `fibo-edit-turbo` takes about 21 GB idle and peaks at about 25 GB at 1152 × 928 with 4 references, rendering in about
-11 s on an RTX PRO 6000. At about 4 MP it drew two people in all 15 renders, and the server does not refuse that size.
+11 s on an RTX PRO 6000. Above about 1.5 MP it doubled people in all tests, so a larger request renders at about 1 MP.
 
 ## Adding a model
 

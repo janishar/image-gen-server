@@ -441,6 +441,12 @@ class TestApi(ServerCase):
         self.assertEqual([p for e, p in registry.log if e == "start"], ["p0", "p1"])
 
 
+class TestFiboSize(ServerCase):
+    def test_accepts_sizes_it_cannot_render_whole(self):
+        body = {"prompt": "x", "model": "fibo-edit-turbo", "images": [b64png()], "width": 2304, "height": 1824}
+        self.wait(self.submit(body)["task_id"], "COMPLETED")
+
+
 class TestModels(ServerCase):
     def test_lists_models_with_limits(self):
         models = self.models()
@@ -450,7 +456,7 @@ class TestModels(ServerCase):
             "precision": {"transformer": "bf16", "text_encoder": "fp8"}, "max_reference_pixels": 5 * 1024**2,
             "ratios": {name: list(size) for name, size in MODELS["flux-klein"].ratios.items()},
             "min_side": 64, "max_side": 4096, "side_multiple": 16, "steps": 16, "max_steps": 16, "options": ["upsample"],
-            "needs_image": False,
+            "needs_image": False, "max_output_pixels": None,
         })
         self.assertEqual(models["flux-klein"]["ratios"]["16:9"], [1360, 768])
         turbo = models["qwen-turbo"]
@@ -458,12 +464,13 @@ class TestModels(ServerCase):
         self.assertEqual((turbo["steps"], turbo["max_steps"], turbo["options"]), (40, 100, ["transparent"]))
         self.assertEqual(turbo["ratios"]["16:9"], [2752, 1536])
         self.assertEqual((turbo["max_images"], turbo["needs_image"]), (10, False))
+        self.assertIsNone(turbo["max_output_pixels"])
         self.assertEqual(models["fibo-edit-turbo"], {
             "id": "fibo-edit-turbo", "loaded": False, "max_images": 4, "max_input_pixels": 15147008, "family": "fibo",
             "precision": {"transformer": "int8", "text_encoder": "int8"}, "max_reference_pixels": 3 * 1024**2,
             "ratios": {name: list(size) for name, size in MODELS["flux-klein"].ratios.items()},
             "min_side": 64, "max_side": 2752, "side_multiple": 16, "steps": 4, "max_steps": 4, "options": [],
-            "needs_image": True,
+            "needs_image": True, "max_output_pixels": 1572864,
         })
 
     def test_fibo_edit_turbo_route(self):
@@ -1077,6 +1084,23 @@ class TestFiboEngine(unittest.TestCase):
         self.assertEqual((kw["width"], kw["height"]), (1360, 768))
         kw = self.render(images=images, ratio="16:9", width=512)
         self.assertEqual((kw["width"], kw["height"]), (512, 768))
+        kw = self.render(images=images, width=512)
+        self.assertEqual((kw["width"], kw["height"]), (512, 1024))  # as the pipeline would for a missing side
+
+    def test_size_it_cannot_render_whole_shrinks_to_1_mp(self):
+        images = (Image.new("RGB", (16, 16)),)
+        for size, expected in (
+            ({"width": 1536, "height": 1024}, (1536, 1024)),  # the limit itself renders as asked
+            ({"width": 2304, "height": 1824}, (1152, 912)),
+            ({"width": 2752, "height": 2752}, (1024, 1024)),
+            ({"width": 2752, "height": 576}, (2240, 464)),  # the narrowest size past the limit
+            ({"width": 2304}, (1536, 688)),  # the pipeline would make the height 1024
+            ({"height": 2304}, (688, 1536)),
+            ({"width": 2304, "ratio": "4:3"}, (1680, 624)),  # 2304 x 864
+        ):
+            kw = self.render(images=images, **size)
+            self.assertEqual((kw["width"], kw["height"]), expected)
+            self.assertEqual((kw["width"] % 16, kw["height"] % 16), (0, 0))
 
     def test_reference_budget(self):
         images = (Image.new("RGB", (2000, 2000)),) * 4

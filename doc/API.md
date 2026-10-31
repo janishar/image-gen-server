@@ -107,6 +107,7 @@ This lists what each configured model accepts, as `{"data": [...]}` in the order
 | `loaded` | Whether the model is in memory now. |
 | `precision` | The weight precision of the transformer and text encoder, the same for every model of a family. See [`GET /health`](#get-health). |
 | `max_images` | The most reference images a request can send: 10, or 4 on `fibo-edit-turbo`. |
+| `max_output_pixels` | The largest size the model renders as asked, or `null` when only `max_side` limits it. A larger request renders at about 1 MP at the same aspect. |
 | `needs_image` | `true` when a request must send at least one image, as `fibo-edit-turbo` must. |
 | `max_input_pixels` | The largest reference image, in pixels. |
 | `max_reference_pixels` | The total reference pixels of a request, the same for every model of a family. Past it every reference shrinks evenly. For `flux-klein` the cap only applies with several references: a single reference keeps the pipeline's own 4 MP limit. `fibo-edit-turbo` scales references back up, so the cap saves it no memory. See [Size](#size). |
@@ -232,14 +233,14 @@ The output size comes from these fields, in this order:
    - Fibo keeps the aspect of the **first** input image at about **1 MP**, the size it was trained at.
 3. `width` and `height` each replace only their own side. The other side still comes from step 1 or 2, so sending
    one alone usually changes the aspect. On Fibo with no `ratio`, the other side is 1024 instead. Send **both** to get
-   an exact size.
+   an exact size, except that on Fibo a size above about 1.5 MP renders smaller. See [Fibo](#fibo).
 
 For any other aspect ratio or size, compute it yourself and send both `width` and `height`. On Qwen, round each to a
 multiple of 32, and keep each between 256 and 2752. For example, 4:5 at about 1 MP is `896 × 1120`, and 21:9 at
 about 2 MP is `2176 × 928`. The largest Qwen output is 2752 on a side, so there's no 4K output. Upscale on the client
-if you need more. On Klein, round each to a multiple of 16, and keep each between 64 and 4096. On Fibo, round each to a
-multiple of 16, and keep each between 64 and 2752; it was trained at about 1 MP. Larger sizes take much more memory and
-time.
+if you need more. On Klein, round each to a multiple of 16, and keep each between 64 and 4096. Larger sizes take much
+more memory and time. On Fibo, round each to a multiple of 16, and keep each between 64 and 2752; it was trained at
+about 1 MP, and a size above about 1.5 MP renders at about 1 MP.
 
 The server caps the total reference pixels of a request per family, with `MAX_REFERENCE_PIXELS` for every family or
 `QWEN_MAX_REFERENCE_PIXELS`, `FLUX_MAX_REFERENCE_PIXELS` and `FIBO_MAX_REFERENCE_PIXELS` for one. `GET /v1/models` reports the cap as
@@ -256,8 +257,9 @@ several references, but they are then scaled back up, so a tight cap loses detai
 `fibo-edit-turbo` only edits, with at least 1 and at most 4 `images`. Its repo is gated behind Bria's access form, and
 it is under CC BY-NC 4.0, so it is non-commercial: commercial use needs an agreement with Bria.
 
-It was trained at about 1 MP. The server does not cap its size, but all 15 renders at about 4 MP drew two people in one
-frame, so check larger outputs.
+A size above about 1.5 MP isn't refused: it renders at about 1 MP at the same aspect, so the image comes back smaller
+than asked. For example, 2304 × 1824 comes back as 1152 × 912. It was trained at about 1 MP, at 4 MP it drew two people
+in one frame, and above about 1.5 MP it doubled people in all tests.
 
 With one image, send a short edit instruction as `prompt`. With several, the instruction refers to them as `<image_1>`,
 `<image_2>` and so on, in the order of `images`:
@@ -308,7 +310,7 @@ they were still in the OS file cache. A swap has not been timed on a CUDA GPU.
 
 These were measured on an Apple M-series Mac (MPS) with 64 GB of memory. No GPU (CUDA) timing has been measured for
 Klein. `fibo-edit-turbo` takes about 21 GB idle and peaks at about 25 GB at 1152 × 928 with 4 references, rendering in about
-11 s on an RTX PRO 6000. At about 4 MP it drew two people in all 15 renders, and the server does not refuse that size.
+11 s on an RTX PRO 6000. Above about 1.5 MP it doubled people in all tests, so a larger request renders at about 1 MP.
 
 | Render | Time |
 | --- | --- |

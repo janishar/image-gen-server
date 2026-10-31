@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 from PIL import Image
 
-from ..schemas import MODELS, GenerateRequest
+from ..schemas import MODELS, GenerateRequest, ModelSpec
 from .common import fit_references, pipeline_quantization, step_callback
 
 
@@ -17,16 +17,29 @@ def load(path: str, device: str, loaded: list, transformer: str, text_encoder: s
     return BriaFibo2Pipeline.from_pretrained(path, dtype=torch.bfloat16, device_map=device, **quantization)
 
 
+def _fit(width: int, height: int, spec: ModelSpec) -> tuple[int, int]:
+    """The size to render: a size past what the model can render whole shrinks to about 1 MP at the same aspect."""
+    if width * height <= spec.max_output_pixels:
+        return width, height
+    scale = (1024**2 / (width * height)) ** 0.5
+    multiple = spec.side_multiple
+    return round(width * scale / multiple) * multiple, round(height * scale / multiple) * multiple
+
+
 def render(pipe, req: GenerateRequest, on_step=None,
            max_reference_pixels: int = 10 * 1024**2) -> tuple[Image.Image, int, None]:
     """Run `req` through `pipe`, calling on_step(done, total) after each step; returns the image, the steps run and
     no caption (only Klein writes one). With no size in `req` the pipeline takes it from the first image."""
-    width, height = MODELS[req.model].ratios[req.ratio] if req.ratio else (None, None)
+    spec = MODELS[req.model]
+    width, height = spec.ratios[req.ratio] if req.ratio else (None, None)
+    width, height = req.width or width, req.height or height
+    if width or height:  # the pipeline makes a missing side 1024
+        width, height = _fit(width or 1024, height or 1024, spec)
     out = pipe(
         prompt=req.prompt,
         image=fit_references(list(req.images), max_reference_pixels),
-        width=req.width or width,
-        height=req.height or height,
+        width=width,
+        height=height,
         num_inference_steps=req.steps,
         guidance_scale=1.0,  # the turbo checkpoint runs without guidance, so a negative prompt would do nothing
         generator=torch.Generator(device="cpu").manual_seed(req.seed),

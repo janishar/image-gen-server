@@ -49,6 +49,7 @@ class ModelSpec:
     options: tuple[str, ...] = ()  # the OPTIONS this model takes
     max_images: int = MAX_IMAGES
     needs_image: bool = False  # edit only: a request with no images is refused
+    max_output_pixels: int | None = None  # past what it can render whole, for models trained at one size: see fibo.py
 
     @property
     def max_input_pixels(self) -> int:
@@ -60,7 +61,9 @@ MODELS = {
     "qwen-base": _QWEN,
     "qwen-turbo": _QWEN,  # takes `steps` but always runs its own 8-step schedule
     "flux-klein": ModelSpec("flux", FLUX_RATIOS, 64, 4096, 16, steps=16, max_steps=16, options=("upsample",)),
-    "fibo-edit-turbo": ModelSpec("fibo", FLUX_RATIOS, 64, 2752, 16, steps=4, max_steps=4, max_images=4, needs_image=True),
+    # trained at about 1 MP: at 4 MP it drew two people in one frame, so a larger request renders at about 1 MP
+    "fibo-edit-turbo": ModelSpec("fibo", FLUX_RATIOS, 64, 2752, 16, steps=4, max_steps=4, max_images=4, needs_image=True,
+                                 max_output_pixels=1536 * 1024),
 }
 
 
