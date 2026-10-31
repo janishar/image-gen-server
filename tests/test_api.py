@@ -441,17 +441,6 @@ class TestApi(ServerCase):
         self.assertEqual([p for e, p in registry.log if e == "start"], ["p0", "p1"])
 
 
-class TestFiboSize(ServerCase):
-    def test_refuses_sizes_it_cannot_render_whole(self):
-        body = {"prompt": "x", "model": "fibo-edit-turbo", "images": [b64png()]}
-        status, _, data = self.request("POST", "/v1/tasks", {**body, "width": 2304, "height": 1824})
-        self.assertEqual(status, 400)
-        self.assertIn("renders at most", json.loads(data)["error"])
-        self.wait(self.submit({**body, "width": 1152, "height": 928})["task_id"], "COMPLETED")
-        status, _, _ = self.request("POST", "/v1/tasks", {"prompt": "x", "model": "qwen-turbo", "width": 2304, "height": 1824})
-        self.assertEqual(status, 202)  # the cap is Fibo's alone
-
-
 class TestModels(ServerCase):
     def test_lists_models_with_limits(self):
         models = self.models()
@@ -461,7 +450,7 @@ class TestModels(ServerCase):
             "precision": {"transformer": "bf16", "text_encoder": "fp8"}, "max_reference_pixels": 5 * 1024**2,
             "ratios": {name: list(size) for name, size in MODELS["flux-klein"].ratios.items()},
             "min_side": 64, "max_side": 4096, "side_multiple": 16, "steps": 16, "max_steps": 16, "options": ["upsample"],
-            "needs_image": False, "max_output_pixels": None,
+            "needs_image": False,
         })
         self.assertEqual(models["flux-klein"]["ratios"]["16:9"], [1360, 768])
         turbo = models["qwen-turbo"]
@@ -469,13 +458,12 @@ class TestModels(ServerCase):
         self.assertEqual((turbo["steps"], turbo["max_steps"], turbo["options"]), (40, 100, ["transparent"]))
         self.assertEqual(turbo["ratios"]["16:9"], [2752, 1536])
         self.assertEqual((turbo["max_images"], turbo["needs_image"]), (10, False))
-        self.assertIsNone(turbo["max_output_pixels"])
         self.assertEqual(models["fibo-edit-turbo"], {
             "id": "fibo-edit-turbo", "loaded": False, "max_images": 4, "max_input_pixels": 15147008, "family": "fibo",
             "precision": {"transformer": "int8", "text_encoder": "int8"}, "max_reference_pixels": 3 * 1024**2,
             "ratios": {name: list(size) for name, size in MODELS["flux-klein"].ratios.items()},
             "min_side": 64, "max_side": 2752, "side_multiple": 16, "steps": 4, "max_steps": 4, "options": [],
-            "needs_image": True, "max_output_pixels": 1572864,
+            "needs_image": True,
         })
 
     def test_fibo_edit_turbo_route(self):

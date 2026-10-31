@@ -107,7 +107,6 @@ This lists what each configured model accepts, as `{"data": [...]}` in the order
 | `loaded` | Whether the model is in memory now. |
 | `precision` | The weight precision of the transformer and text encoder, the same for every model of a family. See [`GET /health`](#get-health). |
 | `max_images` | The most reference images a request can send: 10, or 4 on `fibo-edit-turbo`. |
-| `max_output_pixels` | The largest output in pixels, or `null` when only `max_side` limits it. |
 | `needs_image` | `true` when a request must send at least one image, as `fibo-edit-turbo` must. |
 | `max_input_pixels` | The largest reference image, in pixels. |
 | `max_reference_pixels` | The total reference pixels of a request, the same for every model of a family. Past it every reference shrinks evenly. For `flux-klein` the cap only applies with several references: a single reference keeps the pipeline's own 4 MP limit. `fibo-edit-turbo` scales references back up, so the cap saves it no memory. See [Size](#size). |
@@ -257,8 +256,8 @@ several references, but they are then scaled back up, so a tight cap loses detai
 `fibo-edit-turbo` only edits, with at least 1 and at most 4 `images`. Its repo is gated behind Bria's access form, and
 it is under CC BY-NC 4.0, so it is non-commercial: commercial use needs an agreement with Bria.
 
-It renders at most about 1.5 MP, and a larger `width` and `height` get a `400`: it was trained at about 1 MP, at 4 MP
-it drew two people in one frame, and above about 1.5 MP it doubled people in all tests.
+It was trained at about 1 MP. The server does not cap its size, but all 15 renders at about 4 MP drew two people in one
+frame, so check larger outputs.
 
 With one image, send a short edit instruction as `prompt`. With several, the instruction refers to them as `<image_1>`,
 `<image_2>` and so on, in the order of `images`:
@@ -309,7 +308,7 @@ they were still in the OS file cache. A swap has not been timed on a CUDA GPU.
 
 These were measured on an Apple M-series Mac (MPS) with 64 GB of memory. No GPU (CUDA) timing has been measured for
 Klein. `fibo-edit-turbo` takes about 21 GB idle and peaks at about 25 GB at 1152 × 928 with 4 references, rendering in about
-11 s on an RTX PRO 6000. Above about 1.5 MP it doubled people in all tests, which is why the server refuses that size.
+11 s on an RTX PRO 6000. At about 4 MP it drew two people in all 15 renders, and the server does not refuse that size.
 
 | Render | Time |
 | --- | --- |

@@ -192,7 +192,7 @@ and give the time before it a limit of its own that covers a full load.
 Base and Turbo share one text encoder and VAE, but each has its own transformer: both resident take about 44 GB,
 which fits a 64 GB Mac. Configure only one of them on smaller machines. Klein takes about 20 GB of weights in `bf16`,
 and the optional upsampler about 19 GB more. `fibo-edit-turbo` takes about 21 GB idle and peaks at about 25 GB at 1152 × 928 with 4 references, rendering in about
-11 s on an RTX PRO 6000. Above about 1.5 MP it doubled people in all tests, which is why the server refuses that size.
+11 s on an RTX PRO 6000. At about 4 MP it drew two people in all 15 renders, and the server does not refuse that size.
 
 ## Adding a model
 
