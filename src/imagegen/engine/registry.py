@@ -6,11 +6,12 @@ import gc
 
 import torch
 
+from ..config import FamilySettings
 from ..schemas import MODELS, GenerateRequest
-from . import klein, qwen
+from . import flux, qwen
 from .device import empty_cache, patch_mps_empty_cache
 
-ENGINES = {"qwen": qwen, "klein": klein}  # by ModelSpec.family: each has load() and render()
+ENGINES = {"qwen": qwen, "flux": flux}  # by ModelSpec.family: each has load() and render()
 
 
 class ModelRegistry:
@@ -20,12 +21,11 @@ class ModelRegistry:
     family's queued tasks together if that hurts. Base and Turbo stay resident together, ≈44 GB in bf16 of a 64 GB Mac.
     """
 
-    def __init__(self, model_paths: dict[str, str], device: str, transformer: str = "bf16", text_encoder: str = "bf16",
-                 memory_fraction: float = 0, max_reference_pixels: int = 10 * 1024**2, upsampler_path: str | None = None):
+    def __init__(self, model_paths: dict[str, str], device: str, families: dict[str, FamilySettings],
+                 memory_fraction: float = 0, upsampler_path: str | None = None):
         self.model_paths = dict(model_paths)
         self.device = device
-        self.precision = {"transformer": transformer, "text_encoder": text_encoder}
-        self.max_reference_pixels = max_reference_pixels
+        self.families = dict(families)
         self.upsampler_path = upsampler_path
         self._pipes: dict[str, object] = {}
         self._upsampler = None
@@ -39,8 +39,15 @@ class ModelRegistry:
         return tuple(name for name in MODELS if name in self.model_paths)
 
     @property
+    def precision(self) -> dict[str, dict]:
+        return {
+            family: {"transformer": s.transformer_precision, "text_encoder": s.text_encoder_precision}
+            for family, s in self.families.items()
+        }
+
+    @property
     def can_upsample(self) -> bool:
-        return self.upsampler_path is not None and "klein" in self.model_paths
+        return self.upsampler_path is not None and "flux-klein" in self.model_paths
 
     def status(self) -> dict[str, dict]:
         return {
@@ -70,14 +77,15 @@ class ModelRegistry:
             self._evict(family)
             print(f"Loading {name} from {self.model_paths[name]}", flush=True)
             loaded = list(self._pipes.values())
-            self._pipes[name] = ENGINES[family].load(self.model_paths[name], self.device, loaded, **self.precision)
+            precision = self.precision[family]
+            self._pipes[name] = ENGINES[family].load(self.model_paths[name], self.device, loaded, **precision)
         return self._pipes[name]
 
     def upsampler(self) -> tuple:
         """The upsampler, loading it now if needed. Worker thread only."""
         if self._upsampler is None:
             print(f"Loading the upsampler from {self.upsampler_path}", flush=True)
-            self._upsampler = klein.load_upsampler(self.upsampler_path, self.device)
+            self._upsampler = flux.load_upsampler(self.upsampler_path, self.device)
         return self._upsampler
 
     def render(self, req: GenerateRequest, on_step=None):
@@ -85,8 +93,8 @@ class ModelRegistry:
         try:
             pipe = self.get(req.model)
             extra = {"upsampler": self.upsampler()} if req.upsample else {}
-            engine = ENGINES[MODELS[req.model].family]
-            return engine.render(pipe, req, on_step, self.max_reference_pixels, **extra)
+            family = MODELS[req.model].family
+            return ENGINES[family].render(pipe, req, on_step, self.families[family].max_reference_pixels, **extra)
         finally:
             if self.device == "cuda":  # a vLLM restart needs this memory free
                 torch.cuda.empty_cache()

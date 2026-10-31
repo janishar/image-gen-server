@@ -1,4 +1,4 @@
-"""Load the FLUX 3 Image Klein pipeline and its prompt upsampler, and render one request."""
+"""The flux family's engine: load the FLUX 3 Image Klein pipeline and its prompt upsampler, and render one request."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def load_pipeline(path: str, device: str, transformer: str = "bf16", text_encode
 
 
 def load(path: str, device: str, loaded: list, transformer: str, text_encoder: str):
-    """The pipeline at `path`. Klein has one model, so `loaded` is always empty."""
+    """The pipeline at `path`. The family has one model, so `loaded` is always empty."""
     return load_pipeline(path, device, transformer, text_encoder)
 
 

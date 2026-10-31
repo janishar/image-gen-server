@@ -2,10 +2,10 @@
 
 How to integrate a client with the imagegen server: submit a render task, poll it, and download the PNG.
 
-The server renders Qwen-Image-2.1 (`base`, `turbo`) and FLUX 3 Image Klein (`klein`) images on one GPU. It works on
-**one task at a time**, first in, first out. Each model loads on the first request that needs it and stays in memory
-until a model of another family is asked for (see [Memory](#memory)). Tasks are stored in SQLite, so waiting tasks and
-finished images survive a restart.
+The server renders Qwen-Image-2.1 (`qwen-base`, `qwen-turbo`) and FLUX 3 Image Klein (`flux-klein`) images on one GPU.
+It works on **one task at a time**, first in, first out. Each model loads on the first request that needs it and stays
+in memory until a model of another family is asked for (see [Memory](#memory)). Tasks are stored in SQLite, so waiting
+tasks and finished images survive a restart.
 
 - Base URL: `http://127.0.0.1:8740` by default (`HOST` and `PORT` change it).
 - Every request needs `Authorization: Bearer <IMAGEGEN_API_KEY>`, except `GET /health`. A missing or wrong key gets a
@@ -34,7 +34,7 @@ validates the body before queueing it, so a `202` means the task was accepted.
 | Field | Type | Default | Rules |
 | --- | --- | --- | --- |
 | `prompt` | string | required | Must not be empty. Long prompts (several thousand characters) are fine. |
-| `model` | string | `"turbo"` | `"base"`, `"turbo"` or `"klein"`. It must be configured on the server (see [`GET /v1/models`](#get-v1models)). When the server has no Turbo model, the default is the first configured of `"base"` and `"klein"`. |
+| `model` | string | `"qwen-turbo"` | `"qwen-base"`, `"qwen-turbo"` or `"flux-klein"`. It must be configured on the server (see [`GET /v1/models`](#get-v1models)). When the server has no `"qwen-turbo"`, the default is the first configured model. |
 | `ratio` | string | see [Size](#size) | `1:1`, `4:3`, `3:4`, `3:2`, `2:3`, `16:9`, `9:16` |
 | `width` | integer | see [Size](#size) | Qwen: 256–2752, a multiple of 32. Klein: 64–4096, a multiple of 16. |
 | `height` | integer | see [Size](#size) | Same as `width`. |
@@ -73,18 +73,20 @@ wins over a `model` in the body. A model that is unknown or not configured gets 
 
 ### GET /v1/models
 
-This lists what each configured model accepts, as `{"data": [...]}` in the order `base`, `turbo`, `klein`. Unconfigured
-models are left out. It needs the key.
+This lists what each configured model accepts, as `{"data": [...]}` in the order `qwen-base`, `qwen-turbo`,
+`flux-klein`. Unconfigured models are left out. It needs the key.
 
 ```json
 {
   "data": [
     {
-      "id": "klein",
+      "id": "flux-klein",
       "loaded": false,
+      "precision": {"transformer": "bf16", "text_encoder": "bf16"},
       "max_images": 10,
       "max_input_pixels": 33554432,
-      "family": "klein",
+      "max_reference_pixels": 10485760,
+      "family": "flux",
       "ratios": {"1:1": [1024, 1024], "4:3": [1152, 864], "...": "..."},
       "min_side": 64,
       "max_side": 4096,
@@ -101,9 +103,11 @@ models are left out. It needs the key.
 | --- | --- |
 | `id` | The name to send as `model`. |
 | `loaded` | Whether the model is in memory now. |
+| `precision` | The weight precision of the transformer and text encoder, the same for every model of a family. See [`GET /health`](#get-health). |
 | `max_images` | The most reference images a request can send. |
 | `max_input_pixels` | The largest reference image, in pixels. |
-| `family` | `qwen` or `klein`. One family stays loaded at a time (see [Memory](#memory)). |
+| `max_reference_pixels` | The total reference pixels of a request, the same for every model of a family. Past it every reference shrinks evenly. For `flux-klein` the cap only applies with several references: a single reference keeps the pipeline's own 4 MP limit. See [Size](#size). |
+| `family` | `qwen` or `flux`. One family stays loaded at a time (see [Memory](#memory)). |
 | `ratios` | Each `ratio` and its `[width, height]`. |
 | `min_side`, `max_side`, `side_multiple` | The rules for `width` and `height`. |
 | `steps`, `max_steps` | The default when a request sends none, and the most that run. Turbo reports the Qwen values, `40` and `100`, but always runs 8. |
@@ -118,7 +122,7 @@ This polls a task. A `200` response looks like this:
   "data": {
     "task_id": "47c558c69037443bb66d388f7d655b73",
     "status": "IN_PROGRESS",
-    "model": "turbo",
+    "model": "qwen-turbo",
     "seed": 3,
     "position": null,
     "step": 5,
@@ -154,7 +158,7 @@ the alpha channel. Each JPEG is encoded when you ask for it. Any other `format` 
 
 | Header | Value |
 | --- | --- |
-| `X-Model` | `base`, `turbo` or `klein` |
+| `X-Model` | `qwen-base`, `qwen-turbo` or `flux-klein` |
 | `X-Seed` | the seed used |
 | `X-Steps` | the number of denoising steps actually run (always 8 for Turbo, at most 16 for Klein) |
 | `X-Elapsed-Ms` | the render time (same as `elapsed_ms`) |
@@ -175,11 +179,14 @@ This shows which models and upsampler are configured and loaded, and how busy th
 ```json
 {
   "device": "mps",
-  "precision": {"transformer": "bf16", "text_encoder": "bf16"},
+  "precision": {
+    "qwen": {"transformer": "int8", "text_encoder": "int8"},
+    "flux": {"transformer": "bf16", "text_encoder": "bf16"}
+  },
   "models": {
-    "base": {"configured": true, "loaded": true},
-    "turbo": {"configured": true, "loaded": false},
-    "klein": {"configured": false, "loaded": false}
+    "qwen-base": {"configured": true, "loaded": true},
+    "qwen-turbo": {"configured": true, "loaded": false},
+    "flux-klein": {"configured": false, "loaded": false}
   },
   "upsampler": {"configured": false, "loaded": false},
   "queued": 1,
@@ -191,8 +198,10 @@ This shows which models and upsampler are configured and loaded, and how busy th
 `queued` is the number of tasks waiting, `busy` is whether the worker is rendering or loading a `PRELOAD` model, and `tasks` is the number of tasks
 stored, including finished ones. `models` lists every model the server knows, so use `models.<name>.configured` or
 `GET /v1/models` to decide which to offer. Use `upsampler.configured` to tell whether the server can upsample.
-`precision` is the weight precision the server loads the transformer and text encoder in, `bf16`, `int8`, `fp8` or `fp8_dynamic`
-(transformer only), the same for every model.
+`precision` is the weight precision the server loads the transformer and text encoder in, by family: `bf16`, `int8`,
+`fp8` or `fp8_dynamic` (transformer only). It lists every family the server knows, configured or not. It is per family
+and not per model because `qwen-base` and `qwen-turbo` share one text encoder. `device` is one value for the whole
+server.
 
 ## Size
 
@@ -224,15 +233,17 @@ about 2 MP is `2176 × 928`. The largest Qwen output is 2752 on a side, so there
 if you need more. On Klein, round each to a multiple of 16, and keep each between 64 and 4096. Larger sizes take much
 more memory and time.
 
-The server setting `MAX_REFERENCE_PIXELS` caps the total reference pixels of a request. When it leaves each reference
-less than 1 MP, a request with no size gets a smaller output too: on Qwen with any number of references, on Klein with
-several.
+The server caps the total reference pixels of a request per family, with `MAX_REFERENCE_PIXELS` for every family or
+`QWEN_MAX_REFERENCE_PIXELS` and `FLUX_MAX_REFERENCE_PIXELS` for one. `GET /v1/models` reports the cap as
+`max_reference_pixels`. For `flux-klein` the cap only applies with several references: a single reference keeps the
+pipeline's own 4 MP limit. When the cap leaves each reference less than 1 MP, a request with no size gets a smaller
+output too: on Qwen with any number of references, on `flux-klein` with several.
 
 ## Memory
 
-One family stays loaded at a time: Qwen's `base` and `turbo` together, or Klein with its upsampler. A request for the
-other family unloads the current one and loads its own model first. The upsampler loads on the first `"upsample": true`
-request after that, and leaves with Klein.
+One family stays loaded at a time: `qwen-base` and `qwen-turbo` together, or `flux-klein` with its upsampler. A request
+for the other family unloads the current one and loads its own model first. The upsampler loads on the first
+`"upsample": true` request after that, and leaves with `flux-klein`.
 
 That load is part of the task. The task is `IN_PROGRESS` from `started_at`, and its `step` stays `null` until the load,
 and any upsampling, is done, so longer than usual. The queue is strict first in, first out, so tasks alternating
@@ -249,13 +260,13 @@ Klein.
 
 | Render | Time |
 | --- | --- |
-| First request for a Qwen model | Adds about 10–15 s to load it (set `PRELOAD=base,turbo` to load at startup instead) |
+| First request for a Qwen model | Adds about 10–15 s to load it (set `PRELOAD=qwen-base,qwen-turbo` to load at startup instead) |
 | Turbo, 1024 × 1024 | ~25 s |
 | Turbo, 1344 × 768 | ~28 s |
 | Turbo, 2752 × 1536 | ~2 min |
 | Base, 768 × 768, 12 steps | ~18 s |
 | Base, ~2K, 40 steps | several minutes |
-| First request for Klein | Adds a few seconds to load the model (set `PRELOAD=klein` to load at startup instead) |
+| First request for Klein | Adds a few seconds to load the model (set `PRELOAD=flux-klein` to load at startup instead) |
 | Klein, text-to-image, 1024 × 1024, 16 steps | ~33 s |
 | Klein, edit of a 1024 × 1024 reference, 16 steps | ~75 s |
 | Klein, `"upsample": true` | Adds ~25 s for text-to-image, ~7 s for a one-image edit, on top of loading the upsampler |
@@ -286,8 +297,8 @@ tens of minutes, so set client deadlines with that in mind (see below).
 2. **Poll with backoff.** Start at 1 s and grow to about 10 s. A poll costs the server almost nothing.
 3. **Use two deadlines.**
    - A queue deadline while `CREATED`. `position` tells you how far back the task is.
-   - A render deadline that starts at `started_at` (`IN_PROGRESS`). About 10 minutes covers base at full size. Allow
-     for a full model load on top when the task may swap families.
+   - A render deadline that starts at `started_at` (`IN_PROGRESS`). About 10 minutes covers `qwen-base` at full size.
+     Allow for a full model load on top when the task may swap families.
 
    Don't use one deadline counted from submission: queue time can be arbitrarily long.
 
@@ -359,7 +370,7 @@ async def generate(
     aspect_ratio: str = "1:1",
     megapixels: float = 1.0,
     *,
-    model: str = "turbo",
+    model: str = "qwen-turbo",
     seed: int = 42,
 ) -> bytes:
     """Render one image and return its PNG bytes."""
@@ -410,7 +421,7 @@ async def generate(
 ```bash
 TASK=$(curl -s localhost:8740/v1/tasks \
   -H "Authorization: Bearer $IMAGEGEN_API_KEY" \
-  -d '{"prompt":"a ceramic mug on a wooden table, product photo","model":"turbo","width":1024,"height":1024}' \
+  -d '{"prompt":"a ceramic mug on a wooden table, product photo","model":"qwen-turbo","width":1024,"height":1024}' \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["task_id"])')
 
 until curl -s localhost:8740/v1/tasks/$TASK -H "Authorization: Bearer $IMAGEGEN_API_KEY" | grep -q '"status": "\(COMPLETED\|FAILED\)"'; do sleep 3; done
@@ -422,7 +433,7 @@ When a request has reference images, write the body to a file rather than puttin
 because shell argument limits are about 1 MB:
 
 ```bash
-python3 -c 'import base64,json,sys; print(json.dumps({"prompt": sys.argv[1], "model": "turbo",
+python3 -c 'import base64,json,sys; print(json.dumps({"prompt": sys.argv[1], "model": "qwen-turbo",
   "images": [base64.b64encode(open(p, "rb").read()).decode() for p in sys.argv[2:]]}))' \
   "the same mug in a forest" photo.png > req.json
 curl -s localhost:8740/v1/tasks -H "Authorization: Bearer $IMAGEGEN_API_KEY" --data-binary @req.json

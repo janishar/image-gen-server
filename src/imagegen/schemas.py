@@ -21,7 +21,7 @@ QWEN_RATIOS = {
     "9:16": (1536, 2752),
 }
 
-KLEIN_RATIOS = {
+FLUX_RATIOS = {
     "1:1": (1024, 1024),
     "4:3": (1152, 864),
     "3:4": (864, 1152),
@@ -55,9 +55,9 @@ class ModelSpec:
 
 _QWEN = ModelSpec("qwen", QWEN_RATIOS, 256, 2752, 32, steps=40, max_steps=100, options=("transparent",))
 MODELS = {
-    "base": _QWEN,
-    "turbo": _QWEN,  # takes `steps` but always runs its own 8-step schedule
-    "klein": ModelSpec("klein", KLEIN_RATIOS, 64, 4096, 16, steps=16, max_steps=16, options=("upsample",)),
+    "qwen-base": _QWEN,
+    "qwen-turbo": _QWEN,  # takes `steps` but always runs its own 8-step schedule
+    "flux-klein": ModelSpec("flux", FLUX_RATIOS, 64, 4096, 16, steps=16, max_steps=16, options=("upsample",)),
 }
 
 
@@ -68,7 +68,7 @@ class ValidationError(ValueError):
 @dataclass(frozen=True)
 class GenerateRequest:
     prompt: str
-    model: str = "turbo"
+    model: str = "qwen-turbo"
     ratio: str | None = None
     width: int | None = None
     height: int | None = None
@@ -138,7 +138,7 @@ def parse_request(data: object, available_models: Collection[str], can_upsample:
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValidationError("prompt must be a non-empty string")
 
-    model = data.get("model", "turbo" if "turbo" in available_models else next(iter(available_models)))
+    model = data.get("model", "qwen-turbo" if "qwen-turbo" in available_models else next(iter(available_models)))
     if not isinstance(model, str) or model not in MODELS:
         raise ValidationError(f"model must be one of {', '.join(MODELS)}")
     if model not in available_models:

@@ -58,8 +58,13 @@ def model_views(registry) -> list[dict]:
     for name in registry.configured:
         spec = asdict(MODELS[name])
         spec["options"] = [o for o in spec["options"] if o != "upsample" or registry.can_upsample]
-        limits = {"max_images": MAX_IMAGES, "max_input_pixels": MODELS[name].max_input_pixels}
-        views.append({"id": name, "loaded": status[name]["loaded"], **limits, **spec})
+        limits = {
+            "max_images": MAX_IMAGES,
+            "max_input_pixels": MODELS[name].max_input_pixels,
+            "max_reference_pixels": registry.families[spec["family"]].max_reference_pixels,
+        }
+        precision = registry.precision[spec["family"]]
+        views.append({"id": name, "loaded": status[name]["loaded"], "precision": precision, **limits, **spec})
     return views
 
 

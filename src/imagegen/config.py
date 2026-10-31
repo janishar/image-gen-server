@@ -14,10 +14,19 @@ MIN_API_KEY = 16
 
 
 @dataclass(frozen=True)
+class FamilySettings:
+    """Per ModelSpec.family, not per model: qwen-base and qwen-turbo share one text encoder."""
+
+    transformer_precision: str = "bf16"
+    text_encoder_precision: str = "bf16"
+    max_reference_pixels: int = 10 * 1024**2
+
+
+@dataclass(frozen=True)
 class Settings:
-    base_path: str | None
-    turbo_path: str | None
-    klein_path: str | None
+    qwen_base_path: str | None
+    qwen_turbo_path: str | None
+    flux_klein_path: str | None
     upsampler_path: str | None
     device: str
     host: str
@@ -26,16 +35,14 @@ class Settings:
     max_queued: int
     task_ttl: int
     db_path: str
-    transformer_precision: str
-    text_encoder_precision: str
+    families: dict[str, FamilySettings]
     gpu_memory_fraction: float
-    max_reference_pixels: int
     api_key: str = field(repr=False)
 
     @property
     def model_paths(self) -> dict[str, str]:
         """The configured models, by name."""
-        paths = {"base": self.base_path, "turbo": self.turbo_path, "klein": self.klein_path}
+        paths = {"qwen-base": self.qwen_base_path, "qwen-turbo": self.qwen_turbo_path, "flux-klein": self.flux_klein_path}
         return {name: path for name, path in paths.items() if path}
 
 
@@ -78,6 +85,20 @@ def _fraction(env, key: str) -> float:
     return value
 
 
+def _family(env, family: str) -> FamilySettings:
+    """A family's settings: QWEN_X when set, else X, which covers every family."""
+
+    def key(name: str) -> str:
+        scoped = f"{family.upper()}_{name}"
+        return scoped if env.get(scoped, "").strip() else name
+
+    return FamilySettings(
+        _precision(env, key("TRANSFORMER_PRECISION"), PRECISIONS),
+        _precision(env, key("TEXT_ENCODER_PRECISION"), TEXT_ENCODER_PRECISIONS),
+        _positive(env, key("MAX_REFERENCE_PIXELS"), FamilySettings.max_reference_pixels),
+    )
+
+
 def _api_key(env) -> str:
     value = env.get("IMAGEGEN_API_KEY", "").strip()
     if len(value) < MIN_API_KEY:
@@ -87,10 +108,10 @@ def _api_key(env) -> str:
 
 def load_settings(env=os.environ) -> Settings:
     """Read and check the settings, raising ValueError on anything wrong."""
-    base = _model_dir(env, "QWEN_IMAGE_21_PATH")
-    turbo = _model_dir(env, "QWEN_IMAGE_21_TURBO_PATH")
-    klein = _model_dir(env, "KLEIN_PATH")
-    upsampler = _model_dir(env, "KLEIN_UPSAMPLER_PATH")
+    qwen_base = _model_dir(env, "QWEN_IMAGE_21_PATH")
+    qwen_turbo = _model_dir(env, "QWEN_IMAGE_21_TURBO_PATH")
+    flux_klein = _model_dir(env, "FLUX_KLEIN_PATH")
+    upsampler = _model_dir(env, "FLUX_KLEIN_UPSAMPLER_PATH")
 
     device = env.get("IMAGEGEN_DEVICE", "").strip() or "auto"
     if device not in DEVICES:
@@ -105,9 +126,9 @@ def load_settings(env=os.environ) -> Settings:
         raise ValueError(f"PORT out of range: {port}")
 
     settings = Settings(
-        base_path=base,
-        turbo_path=turbo,
-        klein_path=klein,
+        qwen_base_path=qwen_base,
+        qwen_turbo_path=qwen_turbo,
+        flux_klein_path=flux_klein,
         upsampler_path=upsampler,
         device=device,
         host=env.get("HOST", "").strip() or "127.0.0.1",
@@ -116,14 +137,12 @@ def load_settings(env=os.environ) -> Settings:
         max_queued=_positive(env, "MAX_QUEUED", 64),
         task_ttl=_positive(env, "TASK_TTL", 3600),
         db_path=os.path.abspath(os.path.expanduser(env.get("DB_PATH", "").strip() or "data/imagegen.sqlite3")),
-        transformer_precision=_precision(env, "TRANSFORMER_PRECISION", PRECISIONS),
-        text_encoder_precision=_precision(env, "TEXT_ENCODER_PRECISION", TEXT_ENCODER_PRECISIONS),
+        families={family: _family(env, family) for family in dict.fromkeys(m.family for m in MODELS.values())},
         gpu_memory_fraction=_fraction(env, "GPU_MEMORY_FRACTION"),
-        max_reference_pixels=_positive(env, "MAX_REFERENCE_PIXELS", 10 * 1024**2),
         api_key=_api_key(env),
     )
     if not settings.model_paths:
-        raise ValueError("no model configured: set QWEN_IMAGE_21_PATH, QWEN_IMAGE_21_TURBO_PATH or KLEIN_PATH")
+        raise ValueError("no model configured: set QWEN_IMAGE_21_PATH, QWEN_IMAGE_21_TURBO_PATH or FLUX_KLEIN_PATH")
     for name in settings.preload:
         if name not in settings.model_paths:
             raise ValueError(f"PRELOAD: model {name!r} is not configured (configured: {', '.join(settings.model_paths)})")
